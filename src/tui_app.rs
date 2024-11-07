@@ -14,8 +14,14 @@ pub struct TuiApp {
     app: App,
     view_mode: ViewMode,
     list_state: ListState,
+    scroll_state: u16,
+    focused_pane: Pane,
 }
 
+pub enum Pane {
+    List,
+    Value
+}
 
 pub enum ViewMode {
     Trees,
@@ -34,6 +40,8 @@ impl TuiApp {
             app: App::new(),
             view_mode: ViewMode::Trees,
             list_state,
+            scroll_state: 0,
+            focused_pane: Pane::List,            
         })
     }
 
@@ -112,8 +120,19 @@ impl TuiApp {
                 }
 
                 if let Some(value) = &self.app.current_value {
-                    let value_widget = Paragraph::new(String::from_utf8_lossy(value).to_string())
-                        .block(Block::default().title("Value").borders(Borders::ALL));
+                    let content = String::from_utf8_lossy(value).to_string();
+                    let value_widget = Paragraph::new(content)
+                        .block(Block::default()
+                            .title("Value")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    Color::Blue
+                                } else {
+                                    Color::White
+                                }
+                            )))
+                        .scroll((self.scroll_state, 0));
                     frame.render_widget(value_widget, chunks[1]);
                 }
 
@@ -128,23 +147,45 @@ impl TuiApp {
                             self.view_mode = ViewMode::Trees;
                             self.app.refresh_trees()?;
                         },
+                        KeyCode::Tab => {
+                            self.focused_pane = match self.focused_pane {
+                                Pane::List => Pane::Value,
+                                Pane::Value => Pane::List,
+                            };
+                            self.scroll_state = 0; // Reset scroll when switching panes
+                        },                        
                         KeyCode::Up => {
-                            if let Some(selected) = self.list_state.selected() {
-                                if selected > 0 {
-                                    let key = &self.app.current_keys[selected - 1].to_owned();
-                                    self.app.get_value(key)?;
-                                    self.list_state.select(Some(selected - 1));
+                            match self.focused_pane {
+                                Pane::List => {
+                                    if let Some(selected) = self.list_state.selected() {
+                                        if selected > 0 {
+                                            let key = &self.app.current_keys[selected - 1].to_owned();
+                                            self.app.get_value(key)?;
+                                            self.list_state.select(Some(selected - 1));
+                                        }
+                                    }
                                 }
-                            }
+                                Pane::Value => {
+                                    self.scroll_state = self.scroll_state.saturating_sub(1);
+                                }
+                            }                            
                         }
                         KeyCode::Down => {
-                            if let Some(selected) = self.list_state.selected() {
-                                if selected < self.app.current_keys.len().saturating_sub(1) {
-                                    let key = &self.app.current_keys[selected + 1].to_owned();
-                                    self.app.get_value(key)?;
-                                    self.list_state.select(Some(selected + 1));
+                            match self.focused_pane {
+                                Pane::List => {
+                                    if let Some(selected) = self.list_state.selected() {
+                                        if selected < self.app.current_keys.len().saturating_sub(1) {
+                                            let key = &self.app.current_keys[selected + 1].to_owned();
+                                            self.app.get_value(key)?;
+                                            self.list_state.select(Some(selected + 1));
+                                        }
+                                    }
                                 }
-                            }
+                                Pane::Value => {
+                                    // You might want to add a maximum scroll limit based on content height
+                                    self.scroll_state = self.scroll_state.saturating_add(1);
+                                }
+                            }                            
                         }
                         KeyCode::Enter => {
                             let name = &self.app.current_keys[self.list_state.selected().unwrap_or(0)].to_owned();
@@ -188,6 +229,27 @@ impl TuiApp {
                                 self.list_state.select(Some(0));
                             }
                         },
+                        KeyCode::PageUp => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                self.scroll_state = self.scroll_state.saturating_sub(10);
+                            }
+                        },
+                        KeyCode::PageDown => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                self.scroll_state = self.scroll_state.saturating_add(10);
+                            }
+                        },
+                        KeyCode::Home => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                self.scroll_state = 0;
+                            }
+                        },
+                        KeyCode::End => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                // You might want to calculate this based on content height
+                                self.scroll_state = u16::MAX;
+                            }
+                        },                        
                         _ => {}
                     }
                 }
