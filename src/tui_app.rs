@@ -4,7 +4,10 @@ use crate::app::*;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
-    layout::{Constraint, Direction, Layout}, style::{Color, Style}, widgets::{Block, Borders, List, ListItem, ListState, Paragraph}, DefaultTerminal,
+    layout::{Constraint, Direction, Layout}, 
+    style::{Color, Style},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph}, 
+    DefaultTerminal,
     prelude::Stylize,
 };
 use std::path::PathBuf;
@@ -141,18 +144,10 @@ impl TuiApp {
                     let lines: Vec<&str> = content.split('\n').collect();
                     let visible_width = chunks[1].width.saturating_sub(2);
 
-                    // Calculate total wrapped lines if wrapping is enabled
                     let total_lines = if self.wrap_text {
-                        lines.iter().map(|line| {
-                            if line.is_empty() {
-                                1 // Empty lines still count as one line
-                            } else {
-                                // Calculate how many times this line will wrap
-                                (line.len() as f64 / visible_width as f64).ceil() as usize
-                            }
-                        }).sum::<usize>()
+                        calculate_wrapped_lines(&content, visible_width)
                     } else {
-                        lines.len()
+                        content.split('\n').count()
                     };
 
                     // Calculate max scroll based on total wrapped lines
@@ -223,35 +218,49 @@ impl TuiApp {
                             };
                             self.scroll_state = 0; // Reset scroll when switching panes
                         },                        
-                        KeyCode::Up => {
-                            match self.focused_pane {
-                                Pane::List => {
-                                    if let Some(selected) = self.list_state.selected() {
-                                        if selected > 0 {
-                                            self.app.get_value(selected - 1)?;
-                                            self.list_state.select(Some(selected - 1));
+                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
+                                let movement = if shift_pressed { 10 } else { 1 };
+                                
+                                match key.code {
+                                    KeyCode::Up => {
+                                        self.scroll_state = self.scroll_state.saturating_sub(movement);
+                                    }
+                                    KeyCode::Down => {
+                                        self.scroll_state = (self.scroll_state + movement).min(self.max_scroll);
+                                    }
+                                    KeyCode::Left if !self.wrap_text => {
+                                        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(movement);
+                                    }
+                                    KeyCode::Right if !self.wrap_text => {
+                                        self.horizontal_scroll = (self.horizontal_scroll + movement)
+                                            .min(self.max_horizontal_scroll);
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Your existing list navigation for non-Value pane
+                                match key.code {
+                                    KeyCode::Up => {
+                                        if let Some(selected) = self.list_state.selected() {
+                                            if selected > 0 {
+                                                self.app.get_value(selected - 1)?;
+                                                self.list_state.select(Some(selected - 1));
+                                            }
                                         }
                                     }
-                                }
-                                Pane::Value => {
-                                    self.scroll_state = self.scroll_state.saturating_sub(1);
-                                }
-                            }                            
-                        }
-                        KeyCode::Down => {
-                            match self.focused_pane {
-                                Pane::List => {
-                                    if let Some(selected) = self.list_state.selected() {
-                                        if selected < self.app.current_keys.len().saturating_sub(1) {
-                                            self.app.get_value(selected + 1)?;
-                                            self.list_state.select(Some(selected + 1));
+                                    KeyCode::Down => {
+                                        if let Some(selected) = self.list_state.selected() {
+                                            if selected < self.app.current_keys.len().saturating_sub(1) {
+                                                self.app.get_value(selected + 1)?;
+                                                self.list_state.select(Some(selected + 1));
+                                            }
                                         }
                                     }
+                                    _ => {}
                                 }
-                                Pane::Value => {
-                                    self.scroll_state = self.scroll_state.saturating_add(1).min(self.max_scroll);
-                                }
-                            }                            
+                            }
                         }
                         KeyCode::Enter => {
                             if matches!(self.focused_pane, Pane::List) {
@@ -311,6 +320,7 @@ impl TuiApp {
                         KeyCode::Home => {
                             if matches!(self.focused_pane, Pane::Value) {
                                 self.scroll_state = 0;
+                                self.horizontal_scroll = 0;
                             }
                         },
                         KeyCode::End => {
@@ -324,40 +334,6 @@ impl TuiApp {
                                 self.horizontal_scroll = 0;
                             }
                         },
-                        KeyCode::Left => {
-                            match self.focused_pane {
-                                Pane::Value if !self.wrap_text => {
-                                    self.horizontal_scroll = self.horizontal_scroll.saturating_sub(1);
-                                },
-                                _ => {}
-                            }
-                        },
-                        KeyCode::Right => {
-                            match self.focused_pane {
-                                Pane::Value if !self.wrap_text => {
-                                    self.horizontal_scroll = (self.horizontal_scroll + 1)
-                                        .min(self.max_horizontal_scroll);
-                                },
-                                _ => {}
-                            }
-                        },
-                        KeyCode::Char('h') => {
-                            match self.focused_pane {
-                                Pane::Value if !self.wrap_text => {
-                                    self.horizontal_scroll = self.horizontal_scroll.saturating_sub(10);
-                                },
-                                _ => {}
-                            }
-                        },
-                        KeyCode::Char('l') => {
-                            match self.focused_pane {
-                                Pane::Value if !self.wrap_text => {
-                                    self.horizontal_scroll = (self.horizontal_scroll + 10)
-                                        .min(self.max_horizontal_scroll);
-                                },
-                                _ => {}
-                            }
-                        },                   
                         _ => {}
                     }
                 }
@@ -374,3 +350,44 @@ impl Drop for TuiApp {
         let _ = ratatui::restore();
     }
 }
+
+
+fn calculate_wrapped_lines(text: &str, width: u16) -> usize {
+    let width = width as usize;
+    let mut total_lines = 0;
+
+    for line in text.split('\n') {
+        if line.is_empty() {
+            total_lines += 1;
+            continue;
+        }
+
+        let mut remaining = line;
+        while !remaining.is_empty() {
+            total_lines += 1;
+            
+            // Find the last space within the width limit
+            let mut split_at = width;
+            if remaining.len() > width {
+                // Look for a space to break at
+                if let Some(last_space) = remaining[..width].rfind(' ') {
+                    split_at = last_space + 1;
+                }
+            } else {
+                break;
+            }
+
+            remaining = &remaining[split_at.min(remaining.len())..];
+            
+            // Handle the case where a very long word is wrapped
+            if remaining.len() > width && split_at == width {
+                // No space found, force wrap at width
+                remaining = &remaining[width..];
+            }
+        }
+    }
+
+    total_lines
+}
+
+
