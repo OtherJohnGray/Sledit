@@ -34,9 +34,9 @@ impl App {
     }
 
 
-    pub fn select_tree(&mut self, tree_name: &str) -> Result<()> {
+    pub fn select_tree(&mut self, index: usize) -> Result<()> {
         if let Some(db) = &self.db {
-            self.current_tree = Some(db.open_tree(tree_name)?);
+            self.current_tree = Some(db.open_tree(&self.current_keys[index])?);
             self.current_path.clear();
             self.refresh_keys()?;
         }
@@ -69,8 +69,9 @@ impl App {
         Ok(())
     }
 
-    pub fn has_subkeys(&self, key: &str ) -> bool {
+    pub fn has_subkeys(&self, index: usize ) -> bool {
         if let Some(tree) = &self.current_tree {
+            let key = &self.current_keys[index];
             let path = if self.current_path.len() > 0 {
                     format!("{}/{}/", self.current_path.join("/"), key)
                 } else {
@@ -81,18 +82,19 @@ impl App {
         return false;
     }
 
-    pub fn select_key(&mut self, key: &str) -> Result<()> {
-        if self.has_subkeys(key) {
-            self.current_path.push(key.to_string());
+    pub fn select_key(&mut self, index: usize) -> Result<()> {
+        if self.has_subkeys(index) {
+            self.current_path.push(self.current_keys[index].to_owned());
             self.refresh_keys()?;
         }
         Ok(())
     }
 
-    pub fn get_value(&mut self, key: &str) -> Result<()> {
+    pub fn get_value(&mut self, index: usize) -> Result<()> {
         if let Some(tree) = &self.current_tree {
+            let key = self.current_keys[index].to_owned();
             let mut new_path = self.current_path.clone();
-            new_path.push(key.to_string());
+            new_path.push(key);
             let full_key = new_path.join("/");
             let value = tree.get(full_key.as_bytes())?;
             if let Some(value) = value {

@@ -93,8 +93,9 @@ impl TuiApp {
                     let items: Vec<ListItem> = self.app
                     .current_keys
                     .iter()
-                    .map(|key| {
-                        if self.app.has_subkeys(key) {
+                    .enumerate()  
+                    .map(|(index, key)| { 
+                        if self.app.has_subkeys(index) {
                             ListItem::new(format!("{} +", key))
                         } else {
                             ListItem::new(key.as_str())
@@ -158,8 +159,7 @@ impl TuiApp {
                                 Pane::List => {
                                     if let Some(selected) = self.list_state.selected() {
                                         if selected > 0 {
-                                            let key = &self.app.current_keys[selected - 1].to_owned();
-                                            self.app.get_value(key)?;
+                                            self.app.get_value(selected - 1)?;
                                             self.list_state.select(Some(selected - 1));
                                         }
                                     }
@@ -174,8 +174,7 @@ impl TuiApp {
                                 Pane::List => {
                                     if let Some(selected) = self.list_state.selected() {
                                         if selected < self.app.current_keys.len().saturating_sub(1) {
-                                            let key = &self.app.current_keys[selected + 1].to_owned();
-                                            self.app.get_value(key)?;
+                                            self.app.get_value(selected + 1)?;
                                             self.list_state.select(Some(selected + 1));
                                         }
                                     }
@@ -187,24 +186,24 @@ impl TuiApp {
                             }                            
                         }
                         KeyCode::Enter => {
-                            let name = &self.app.current_keys[self.list_state.selected().unwrap_or(0)].to_owned();
                             match self.view_mode {
                                 ViewMode::Trees => {
                                     self.view_mode = ViewMode::Keys;
-                                    self.app.select_tree(&name)?;
+                                    self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
                                     if self.app.current_keys.len() > 0 {
-                                        self.app.get_value(&self.app.current_keys[0].to_owned())?;
+                                        self.app.get_value(0)?;
                                         self.list_state.select(Some(0));
                                     } else {
                                         self.list_state.select(None);
                                     }
                                 }
                                 ViewMode::Keys => {
-                                    if self.app.has_subkeys(name) {
-                                        self.app.select_key(&name)?;
+                                    let index = self.list_state.selected().unwrap_or(0);
+                                    if self.app.has_subkeys(index) {
+                                        self.app.select_key(index)?;
                                         if self.app.current_keys.len() > 0 {
                                             self.list_state.select(Some(0));
-                                            self.app.get_value(&self.app.current_keys[0].to_owned())?;
+                                            self.app.get_value(0)?;
                                         } else {
                                             self.list_state.select(None);
                                         }
@@ -216,7 +215,7 @@ impl TuiApp {
                             if self.app.current_path.len() > 1 {
                                 self.app.go_back_in_path()?;
                                 if self.app.current_keys.len() > 0 {
-                                    self.app.get_value(&self.app.current_keys[0].to_owned())?;
+                                    self.app.get_value(0)?;
                                     self.list_state.select(Some(0));    
                                 } else {
                                     self.list_state.select(None);
