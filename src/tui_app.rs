@@ -16,8 +16,14 @@ pub struct TuiApp {
     list_state: ListState,
     scroll_state: u16,
     focused_pane: Pane,
+    max_scroll: u16,
+    page_height: u16,
+    wrap_text: bool,
+    horizontal_scroll: u16,
+    max_horizontal_scroll: u16,
 }
 
+#[derive(PartialEq)]
 pub enum Pane {
     List,
     Value
@@ -44,8 +50,13 @@ impl TuiApp {
             app: app,
             view_mode: ViewMode::Trees,
             list_state,
+            focused_pane: Pane::List,
             scroll_state: 0,
-            focused_pane: Pane::List,            
+            max_scroll: 0,
+            page_height: 0, 
+            wrap_text: true,
+            horizontal_scroll: 0,
+            max_horizontal_scroll: 0,
         })
     }
 
@@ -60,6 +71,8 @@ impl TuiApp {
                         Constraint::Min(0),     // Main content
                     ].as_ref())
                     .split(frame.area());
+
+                self.page_height = vertical_chunks[1].height - 2;
 
                 // Render path at top
                 let path_text = match self.view_mode {
@@ -108,7 +121,6 @@ impl TuiApp {
                         .title(list_title)
                         .borders(Borders::ALL))
                         .highlight_style(Style::default().reversed());
-                        // .highlight_style(Style::default().bg(Color::Gray));
                 
                     frame.render_stateful_widget(keys_list, chunks[0], &mut self.list_state);
                 } else {
@@ -119,25 +131,82 @@ impl TuiApp {
                     };
 
                     frame.render_widget(
-                        Paragraph::new(format!("No Keys found in tree {}", &tree_name)), // assume key mode if we got her, since there is always a Default item in trees list.
+                        Paragraph::new(format!("No Keys found in tree {}", &tree_name)), // assume key mode if we got here, since there is always a Default item in trees list.
                         chunks[0]
                     );
                 }
 
                 if let Some(value) = &self.app.current_value {
                     let content = String::from_utf8_lossy(value).to_string();
+                    let lines: Vec<&str> = content.split('\n').collect();
+                    let visible_width = chunks[1].width.saturating_sub(2);
+
+                    // Calculate total wrapped lines if wrapping is enabled
+                    let total_lines = if self.wrap_text {
+                        lines.iter().map(|line| {
+                            if line.is_empty() {
+                                1 // Empty lines still count as one line
+                            } else {
+                                // Calculate how many times this line will wrap
+                                (line.len() as f64 / visible_width as f64).ceil() as usize
+                            }
+                        }).sum::<usize>()
+                    } else {
+                        lines.len()
+                    };
+
+                    // Calculate max scroll based on total wrapped lines
+                    self.max_scroll = total_lines.saturating_sub(self.page_height as usize) as u16;
+                    self.scroll_state = self.scroll_state.min(self.max_scroll);
+
+                    self.max_horizontal_scroll = if !self.wrap_text {
+                        lines.iter()
+                            .map(|line| line.len() as u16)
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_sub(visible_width)
+                    } else {
+                        0
+                    };
+                    self.horizontal_scroll = self.horizontal_scroll.min(self.max_horizontal_scroll);
+
+                    let wrap_indicator = if self.wrap_text { "W" } else { "NW" };
+                    let scroll_indicator = if self.max_scroll > 0 {
+                        format!(" [{}/{}]", self.scroll_state + 1, self.max_scroll + 1)
+                    } else {
+                        String::new()
+                    };
+                    let h_scroll_indicator = if !self.wrap_text && self.max_horizontal_scroll > 0 {
+                        format!(" <{}>", self.horizontal_scroll)
+                    } else {
+                        String::new()
+                    };                    
+
                     let value_widget = Paragraph::new(content)
-                        .block(Block::default()
-                            .title("Value")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    Color::Blue
-                                } else {
-                                    Color::White
-                                }
-                            )))
-                        .scroll((self.scroll_state, 0));
+                    .block(Block::default()
+                        .title(format!("Value [{}]{}{}", 
+                            wrap_indicator, 
+                            scroll_indicator,
+                            h_scroll_indicator
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(
+                            if matches!(self.focused_pane, Pane::Value) {
+                                Color::Blue
+                            } else {
+                                Color::White
+                            }
+                        )));
+                
+                    let value_widget = if self.wrap_text {
+                        value_widget.wrap(ratatui::widgets::Wrap { trim: false })
+                    } else {
+                        value_widget
+                    };
+                    
+                    let value_widget = value_widget.scroll((self.scroll_state, self.horizontal_scroll));
+                
+
                     frame.render_widget(value_widget, chunks[1]);
                 }
 
@@ -180,38 +249,40 @@ impl TuiApp {
                                     }
                                 }
                                 Pane::Value => {
-                                    // You might want to add a maximum scroll limit based on content height
-                                    self.scroll_state = self.scroll_state.saturating_add(1);
+                                    self.scroll_state = self.scroll_state.saturating_add(1).min(self.max_scroll);
                                 }
                             }                            
                         }
                         KeyCode::Enter => {
-                            match self.view_mode {
-                                ViewMode::Trees => {
-                                    self.view_mode = ViewMode::Keys;
-                                    self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
-                                    if self.app.current_keys.len() > 0 {
-                                        self.app.get_value(0)?;
-                                        self.list_state.select(Some(0));
-                                    } else {
-                                        self.list_state.select(None);
-                                    }
-                                }
-                                ViewMode::Keys => {
-                                    let index = self.list_state.selected().unwrap_or(0);
-                                    if self.app.has_subkeys(index) {
-                                        self.app.select_key(index)?;
+                            if matches!(self.focused_pane, Pane::List) {
+                                match self.view_mode {
+                                    ViewMode::Trees => {
+                                        self.view_mode = ViewMode::Keys;
+                                        self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
                                         if self.app.current_keys.len() > 0 {
-                                            self.list_state.select(Some(0));
                                             self.app.get_value(0)?;
+                                            self.list_state.select(Some(0));
                                         } else {
                                             self.list_state.select(None);
+                                        }
+                                    }
+                                    ViewMode::Keys => {
+                                        let index = self.list_state.selected().unwrap_or(0);
+                                        if self.app.has_subkeys(index) {
+                                            self.app.select_key(index)?;
+                                            if self.app.current_keys.len() > 0 {
+                                                self.list_state.select(Some(0));
+                                                self.app.get_value(0)?;
+                                            } else {
+                                                self.list_state.select(None);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                         KeyCode::Backspace => {
+                            self.focused_pane = Pane::List;
                             if self.app.current_path.len() > 1 {
                                 self.app.go_back_in_path()?;
                                 if self.app.current_keys.len() > 0 {
@@ -229,12 +300,12 @@ impl TuiApp {
                         },
                         KeyCode::PageUp => {
                             if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = self.scroll_state.saturating_sub(10);
+                                self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
                             }
                         },
                         KeyCode::PageDown => {
                             if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = self.scroll_state.saturating_add(10);
+                                self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
                             }
                         },
                         KeyCode::Home => {
@@ -244,10 +315,49 @@ impl TuiApp {
                         },
                         KeyCode::End => {
                             if matches!(self.focused_pane, Pane::Value) {
-                                // You might want to calculate this based on content height
-                                self.scroll_state = u16::MAX;
+                                self.scroll_state = self.max_scroll;
                             }
-                        },                        
+                        },     
+                        KeyCode::Char('w') => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                self.wrap_text = !self.wrap_text;
+                                self.horizontal_scroll = 0;
+                            }
+                        },
+                        KeyCode::Left => {
+                            match self.focused_pane {
+                                Pane::Value if !self.wrap_text => {
+                                    self.horizontal_scroll = self.horizontal_scroll.saturating_sub(1);
+                                },
+                                _ => {}
+                            }
+                        },
+                        KeyCode::Right => {
+                            match self.focused_pane {
+                                Pane::Value if !self.wrap_text => {
+                                    self.horizontal_scroll = (self.horizontal_scroll + 1)
+                                        .min(self.max_horizontal_scroll);
+                                },
+                                _ => {}
+                            }
+                        },
+                        KeyCode::Char('h') => {
+                            match self.focused_pane {
+                                Pane::Value if !self.wrap_text => {
+                                    self.horizontal_scroll = self.horizontal_scroll.saturating_sub(10);
+                                },
+                                _ => {}
+                            }
+                        },
+                        KeyCode::Char('l') => {
+                            match self.focused_pane {
+                                Pane::Value if !self.wrap_text => {
+                                    self.horizontal_scroll = (self.horizontal_scroll + 10)
+                                        .min(self.max_horizontal_scroll);
+                                },
+                                _ => {}
+                            }
+                        },                   
                         _ => {}
                     }
                 }
