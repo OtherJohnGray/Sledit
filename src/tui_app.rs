@@ -4,7 +4,7 @@ use crate::app::*;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
-    layout::{Constraint, Direction, Layout}, prelude::Margin, style::{Color, Style}, widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph}, DefaultTerminal,
+    layout::{Constraint, Direction, Layout}, style::{Color, Style}, widgets::{Block, Borders, List, ListItem, ListState, Paragraph}, DefaultTerminal,
     prelude::Stylize,
 };
 use std::path::PathBuf;
@@ -30,14 +30,18 @@ pub enum ViewMode {
 
 
 impl TuiApp {
-    pub fn new() -> Result<Self> {
+    pub fn new(db_path: PathBuf) -> Result<Self> {
         let terminal = ratatui::init();
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         
+        let mut app = App::new();
+        app.db = Some(sled::open(db_path)?);
+        app.refresh_trees()?;
+
         Ok(Self {
             terminal,
-            app: App::new(),
+            app: app,
             view_mode: ViewMode::Trees,
             list_state,
             scroll_state: 0,
@@ -142,11 +146,6 @@ impl TuiApp {
                 if let Event::Key(key) = event::read()? {
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('o') => {
-                            self.open_db()?;
-                            self.view_mode = ViewMode::Trees;
-                            self.app.refresh_trees()?;
-                        },
                         KeyCode::Tab => {
                             self.focused_pane = match self.focused_pane {
                                 Pane::List => Pane::Value,
@@ -257,171 +256,6 @@ impl TuiApp {
         }
         Ok(())
     }
-
-
-    fn file_select(&mut self) -> Result<Option<PathBuf>> {
-        let mut current_dir = std::env::current_dir()?;
-        let mut selected_index = 0;
-        
-        loop {
-            let mut entries = vec![PathBuf::from("..")];  // Add parent directory option
-            entries.extend(
-                std::fs::read_dir(&current_dir)?
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_dir())  // Only show directories since sled DBs are directories
-                    .collect::<Vec<_>>()
-            );
-
-            let items: Vec<String> = entries.iter()
-                .map(|path| {
-                    if path == &PathBuf::from("..") {
-                        String::from("..")
-                    } else {
-                        let name = path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("???");
-                        format!("📁 {}", name)
-                    }
-                })
-                .collect();
-
-            self.terminal.draw(|frame| {
-                let area = frame.area();
-                let width = area.width.min(60);
-                let height = area.height.min(20);
-                let x = (area.width - width) / 2;
-                let y = (area.height - height) / 2;
-                
-                let modal_area = ratatui::layout::Rect::new(x, y, width, height);
-                
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .title("Select Database Directory (Enter to navigate, s to select)");
-                
-                let items: Vec<ListItem> = items.iter()
-                    .map(|item| ListItem::new(item.as_str()))
-                    .collect();
-                
-                let list = List::new(items)
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::Blue)  // Blue background for selection
-                            .fg(Color::White)  // White text for selection
-                    );
-                
-                let mut list_state = ListState::default();
-                list_state.select(Some(selected_index));
-                
-                frame.render_widget(Clear, modal_area);
-                frame.render_widget(block.clone(), modal_area);
-                frame.render_stateful_widget(
-                    list,
-                    modal_area.inner(Margin { vertical: 1, horizontal: 1 }),
-                    &mut list_state
-                );
-            })?;
-
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Esc => return Ok(None),
-                        KeyCode::Up => {
-                            selected_index = selected_index.saturating_sub(1);
-                        }
-                        KeyCode::Down => {
-                            if selected_index < entries.len() - 1 {
-                                selected_index += 1;
-                            }
-                        }
-                        KeyCode::Char('s') => {
-                            // Enter selects the current directory as the database
-                            let selected_path = &entries[selected_index];
-                            if selected_path != &PathBuf::from("..") {
-                                return Ok(Some(selected_path.clone()));
-                            }
-                        }
-                        KeyCode::Enter => {
-                            // Space enters the directory for navigation
-                            let selected_path = &entries[selected_index];
-                            if selected_path == &PathBuf::from("..") {
-                                if let Some(parent) = current_dir.parent() {
-                                    current_dir = parent.to_path_buf();
-                                    selected_index = 0;
-                                }
-                            } else {
-                                current_dir = selected_path.clone();
-                                selected_index = 0;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // fn handle_selection(&mut self) -> Result<()> {
-    //     match self.view_mode {
-    //         ViewMode::Trees => self.select_tree()?,
-    //         ViewMode::Keys => self.app.select_key()?,
-    //     }
-    //     Ok(())
-    // }
-
-    // fn select_tree(&mut self) -> Result<()> {
-    //     if let Some(selected_index) = self.list_state.selected() {
-    //         if let Some(selected_tree) = self.app.current_keys.get(selected_index) {
-    //             // Update model
-    //             self.app.select_tree(&selected_tree.to_owned())?;
-    //             // Update view state
-    //             self.view_mode = ViewMode::Keys;
-    //             self.list_state.select(Some(0));
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    fn open_db(&mut self) -> Result<()> {
-        if let Some(path) = self.file_select()? {
-            self.app.db = Some(sled::open(path)?);
-            self.app.current_tree = None;
-            self.app.current_path.clear();
-            self.app.current_value = None;
-            self.view_mode = ViewMode::Trees;  // Set view mode to Trees
-            self.app.refresh_trees()?;  // Show available trees
-        }
-        Ok(())
-    }
-
-    // pub fn handle_go_back(&mut self) -> Result<()> {
-    //     match self.view_mode {
-    //         ViewMode::Trees => {
-    //             self.app.clear_db();
-    //         }
-    //         ViewMode::Keys => {
-    //             if self.app.current_path.is_empty() {
-    //                 // If at root level of keys, go back to trees view
-    //                 self.view_mode = ViewMode::Trees;
-    //                 self.app.current_tree = None;
-    //                 self.app.refresh_trees()?;
-    //             } else {
-    //                 // Otherwise go up one level in the key hierarchy
-    //                 self.app.go_back_in_path()?;
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    // pub fn handle_key_selection(&mut self) -> Result<()> {
-    //     if let Some(selected_index) = self.list_state.selected() {
-    //         if let Some(selected_key) = self.app.current_keys.get(selected_index) {
-    //             self.app.select_key(&selected_key.to_owned())?;
-    //         }
-    //     }
-    //     Ok(())
-    // }    
 
 }    
 
