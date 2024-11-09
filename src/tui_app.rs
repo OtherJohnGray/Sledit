@@ -11,6 +11,8 @@ use ratatui::{
     prelude::Stylize,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct TuiApp {
     terminal: DefaultTerminal,
@@ -24,6 +26,7 @@ pub struct TuiApp {
     wrap_text: bool,
     horizontal_scroll: u16,
     max_horizontal_scroll: u16,
+    status_message: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -40,7 +43,8 @@ pub enum ViewMode {
 
 impl TuiApp {
     pub fn new(db_path: PathBuf) -> Result<Self> {
-        let terminal = ratatui::init();
+        let mut terminal = ratatui::init();
+        terminal.clear()?;
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         
@@ -60,11 +64,12 @@ impl TuiApp {
             wrap_text: true,
             horizontal_scroll: 0,
             max_horizontal_scroll: 0,
+            status_message: None,
         })
     }
 
 
-    pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self, running: Arc<AtomicBool>) -> Result<()> {
         loop {
             self.terminal.draw(|frame| {
                 let vertical_chunks = Layout::default()
@@ -72,6 +77,7 @@ impl TuiApp {
                     .constraints([
                         Constraint::Length(3),  // Path display
                         Constraint::Min(0),     // Main content
+                        Constraint::Length(1),  // info bar
                     ].as_ref())
                     .split(frame.area());
 
@@ -93,6 +99,19 @@ impl TuiApp {
                 let path_widget = Paragraph::new(path_text)
                     .block(Block::default().borders(Borders::ALL));
                 frame.render_widget(path_widget, vertical_chunks[0]);
+
+
+                // render info bar
+                if let Some(message) = &self.status_message {
+                    frame.render_widget(Paragraph::new(message.to_owned()), vertical_chunks[2]);
+                } else {
+                    let key_help = match self.focused_pane {
+                        Pane::List =>   "q)uit - [enter] show subkeys - [backspace] show parent key - ↓↑ select key - [tab] select value pane - ←→ resize panes",
+                        Pane::Value =>  "↓↑←→ scroll - [shift] x10 - [tab] select key pane - e)dit"
+                    };
+                    frame.render_widget(Paragraph::new(key_help), vertical_chunks[2]);
+
+                }
 
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
@@ -208,133 +227,150 @@ impl TuiApp {
             })?;
 
             if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Tab => {
-                            self.focused_pane = match self.focused_pane {
-                                Pane::List => Pane::Value,
-                                Pane::Value => Pane::List,
-                            };
-                            self.scroll_state = 0; // Reset scroll when switching panes
-                        },                        
-                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
-                                let movement = if shift_pressed { 10 } else { 1 };
-                                
-                                match key.code {
-                                    KeyCode::Up => {
-                                        self.scroll_state = self.scroll_state.saturating_sub(movement);
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                match event::read()? {
+                    Event::FocusGained => {},
+                    Event::FocusLost => {},
+                    Event::Mouse(_) => {},
+                    Event::Resize(_,_) => {},                    
+                    Event::Paste(content) => {
+                        if matches!(self.focused_pane, Pane::Value) {
+                            self.app.current_value = Some(content.into_bytes());
+                            self.status_message = Some("Pasted content into current value".into());
+                        }
+                    },
+                    Event::Key(key) => {
+                        self.status_message = None;
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Tab => {
+                                self.focused_pane = match self.focused_pane {
+                                    Pane::List => Pane::Value,
+                                    Pane::Value => Pane::List,
+                                };
+                                self.scroll_state = 0; // Reset scroll when switching panes
+                            },
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
+                                    let movement = if shift_pressed { 10 } else { 1 };
+                                    
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            self.scroll_state = self.scroll_state.saturating_sub(movement);
+                                        }
+                                        KeyCode::Down => {
+                                            self.scroll_state = (self.scroll_state + movement).min(self.max_scroll);
+                                        }
+                                        KeyCode::Left if !self.wrap_text => {
+                                            self.horizontal_scroll = self.horizontal_scroll.saturating_sub(movement);
+                                        }
+                                        KeyCode::Right if !self.wrap_text => {
+                                            self.horizontal_scroll = (self.horizontal_scroll + movement)
+                                                .min(self.max_horizontal_scroll);
+                                        }
+                                        _ => {}
                                     }
-                                    KeyCode::Down => {
-                                        self.scroll_state = (self.scroll_state + movement).min(self.max_scroll);
-                                    }
-                                    KeyCode::Left if !self.wrap_text => {
-                                        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(movement);
-                                    }
-                                    KeyCode::Right if !self.wrap_text => {
-                                        self.horizontal_scroll = (self.horizontal_scroll + movement)
-                                            .min(self.max_horizontal_scroll);
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                // Your existing list navigation for non-Value pane
-                                match key.code {
-                                    KeyCode::Up => {
-                                        if let Some(selected) = self.list_state.selected() {
-                                            if selected > 0 {
-                                                self.app.get_value(selected - 1)?;
-                                                self.list_state.select(Some(selected - 1));
+                                } else {
+                                    // Your existing list navigation for non-Value pane
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            if let Some(selected) = self.list_state.selected() {
+                                                if selected > 0 {
+                                                    self.app.get_value(selected - 1)?;
+                                                    self.list_state.select(Some(selected - 1));
+                                                }
                                             }
                                         }
-                                    }
-                                    KeyCode::Down => {
-                                        if let Some(selected) = self.list_state.selected() {
-                                            if selected < self.app.current_keys.len().saturating_sub(1) {
-                                                self.app.get_value(selected + 1)?;
-                                                self.list_state.select(Some(selected + 1));
+                                        KeyCode::Down => {
+                                            if let Some(selected) = self.list_state.selected() {
+                                                if selected < self.app.current_keys.len().saturating_sub(1) {
+                                                    self.app.get_value(selected + 1)?;
+                                                    self.list_state.select(Some(selected + 1));
+                                                }
                                             }
                                         }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
                             }
-                        }
-                        KeyCode::Enter => {
-                            if matches!(self.focused_pane, Pane::List) {
-                                match self.view_mode {
-                                    ViewMode::Trees => {
-                                        self.view_mode = ViewMode::Keys;
-                                        self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
-                                        if self.app.current_keys.len() > 0 {
-                                            self.app.get_value(0)?;
-                                            self.list_state.select(Some(0));
-                                        } else {
-                                            self.list_state.select(None);
-                                        }
-                                    }
-                                    ViewMode::Keys => {
-                                        let index = self.list_state.selected().unwrap_or(0);
-                                        if self.app.has_subkeys(index) {
-                                            self.app.select_key(index)?;
+                            KeyCode::Enter => {
+                                if matches!(self.focused_pane, Pane::List) {
+                                    match self.view_mode {
+                                        ViewMode::Trees => {
+                                            self.view_mode = ViewMode::Keys;
+                                            self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
                                             if self.app.current_keys.len() > 0 {
-                                                self.list_state.select(Some(0));
                                                 self.app.get_value(0)?;
+                                                self.list_state.select(Some(0));
                                             } else {
                                                 self.list_state.select(None);
                                             }
                                         }
+                                        ViewMode::Keys => {
+                                            let index = self.list_state.selected().unwrap_or(0);
+                                            if self.app.has_subkeys(index) {
+                                                self.app.select_key(index)?;
+                                                if self.app.current_keys.len() > 0 {
+                                                    self.list_state.select(Some(0));
+                                                    self.app.get_value(0)?;
+                                                } else {
+                                                    self.list_state.select(None);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
-                        KeyCode::Backspace => {
-                            self.focused_pane = Pane::List;
-                            if self.app.current_path.len() > 1 {
-                                self.app.go_back_in_path()?;
-                                if self.app.current_keys.len() > 0 {
-                                    self.app.get_value(0)?;
-                                    self.list_state.select(Some(0));    
-                                } else {
-                                    self.list_state.select(None);
+                            KeyCode::Backspace => {
+                                self.focused_pane = Pane::List;
+                                if self.app.current_path.len() > 1 {
+                                    self.app.go_back_in_path()?;
+                                    if self.app.current_keys.len() > 0 {
+                                        self.app.get_value(0)?;
+                                        self.list_state.select(Some(0));    
+                                    } else {
+                                        self.list_state.select(None);
+                                    }
+                                } else { // go back to tree mode, assume at least Default tree available
+                                    self.view_mode = ViewMode::Trees;
+                                    self.app.refresh_trees()?;
+                                    self.app.current_value = None;
+                                    self.list_state.select(Some(0));
                                 }
-                            } else { // go back to tree mode, assume at least Default tree available
-                                self.view_mode = ViewMode::Trees;
-                                self.app.refresh_trees()?;
-                                self.app.current_value = None;
-                                self.list_state.select(Some(0));
-                            }
-                        },
-                        KeyCode::PageUp => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
-                            }
-                        },
-                        KeyCode::PageDown => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
-                            }
-                        },
-                        KeyCode::Home => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = 0;
-                                self.horizontal_scroll = 0;
-                            }
-                        },
-                        KeyCode::End => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                self.scroll_state = self.max_scroll;
-                            }
-                        },     
-                        KeyCode::Char('w') => {
-                            if matches!(self.focused_pane, Pane::Value) {
-                                self.wrap_text = !self.wrap_text;
-                                self.horizontal_scroll = 0;
-                            }
-                        },
-                        _ => {}
+                            },
+                            KeyCode::PageUp => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
+                                }
+                            },
+                            KeyCode::PageDown => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
+                                }
+                            },
+                            KeyCode::Home => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    self.scroll_state = 0;
+                                    self.horizontal_scroll = 0;
+                                }
+                            },
+                            KeyCode::End => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    self.scroll_state = self.max_scroll;
+                                }
+                            },     
+                            KeyCode::Char('w') => {
+                                if matches!(self.focused_pane, Pane::Value) {
+                                    self.wrap_text = !self.wrap_text;
+                                    self.horizontal_scroll = 0;
+                                }
+                            },
+
+                            _ => {}
+                        }
                     }
                 }
             }
