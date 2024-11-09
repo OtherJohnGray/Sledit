@@ -36,9 +36,10 @@ fn main() -> Result<()> {
     
     if cli.make_example_db {
         example::create_example_db(&cli.db_path, running)?;
-    } 
+    } else {
+        let mut tui = TuiApp::new(cli.db_path)?;
+        tui.run(running)?;
+    }
 
-    let mut tui = TuiApp::new(cli.db_path)?;
-    tui.run(running)?;
     Ok(())
 }

@@ -19,14 +19,16 @@ pub struct TuiApp {
     app: App,
     view_mode: ViewMode,
     list_state: ListState,
-    scroll_state: u16,
     focused_pane: Pane,
+    scroll_state: usize,
     max_scroll: u16,
     page_height: u16,
     wrap_text: bool,
     horizontal_scroll: u16,
     max_horizontal_scroll: u16,
     status_message: Option<String>,
+    list_offset: usize,     // Starting index of the current window
+    list_height: u16,
 }
 
 #[derive(PartialEq)]
@@ -65,7 +67,89 @@ impl TuiApp {
             horizontal_scroll: 0,
             max_horizontal_scroll: 0,
             status_message: None,
+            list_offset: 0,
+            list_height: 0,     
         })
+    }
+
+
+    fn update_list(&mut self) -> Result<()> {
+        // Get just enough items to fill the visible area
+        self.app.get_keys_range(self.list_offset, self.list_height as usize)?;
+        Ok(())
+    }
+
+    fn handle_list_navigation(&mut self, key: KeyCode) -> Result<()> {
+        let total_keys = self.app.total_keys();
+        if total_keys == 0 {
+            return Ok(());
+        }
+
+        let relative_selection = self.list_state.selected().unwrap_or(0);  // Relative to visible items
+        let absolute_selection = self.list_offset + relative_selection;  // Actual position in full dataset
+
+
+        match key {
+            KeyCode::Up => {
+                if absolute_selection > 0 {
+                    if relative_selection > 0 {
+                        // Just move the selection up
+                        self.list_state.select(Some(relative_selection - 1));
+                    } else {
+                        // At top of window, need to shift window up
+                        self.list_offset = self.list_offset.saturating_sub(1);
+                        self.update_list()?;
+                    }
+                    // Update the value display
+                    self.app.get_value(self.list_offset + self.list_state.selected().unwrap_or(0))?;
+                }
+            },
+            KeyCode::Down => {
+                if absolute_selection + 1 < total_keys {
+                    if relative_selection + 1 < self.list_height as usize {
+                        // Just move the selection down
+                        self.list_state.select(Some(relative_selection + 1));
+                    } else {
+                        // At bottom of window, need to shift window down
+                        self.list_offset += 1;
+                        self.update_list()?;
+                    }
+                    // Update the value display
+                    self.app.get_value(self.list_offset + self.list_state.selected().unwrap_or(0))?;
+                }
+            },
+            KeyCode::PageUp => {
+                if self.list_offset > 0 {
+                    // Move window up by visible_height or to start
+                    self.list_offset = self.list_offset.saturating_sub(self.list_height as usize);
+                    self.update_list()?;
+                    // Keep selection at top of new window
+                    self.list_state.select(Some(0));
+                    self.app.get_value(self.list_offset)?;
+                } else if relative_selection > 0 {
+                    // Already at top of data, just move selection to top of window
+                    self.list_state.select(Some(0));
+                    self.app.get_value(0)?;
+                }
+            },
+            KeyCode::PageDown => {
+                let max_offset = total_keys.saturating_sub(self.list_height);
+                if self.list_offset < max_offset {
+                    // Move window down by visible_height or to end
+                    self.list_offset = (self.list_offset + self.list_height).min(max_offset);
+                    self.update_list()?;
+                    // Keep selection at top of new window
+                    self.list_state.select(Some(0));
+                    self.app.get_value(self.list_offset)?;
+                } else if relative_selection < self.list_items.len() - 1 {
+                    // Already at bottom of data, just move selection to bottom of window
+                    self.list_state.select(Some(self.list_items.len() - 1));
+                    self.app.get_value(self.list_offset + self.list_items.len() - 1)?;
+                }
+            },
+            _ => {}
+        }
+        Ok(())
     }
 
 
@@ -81,7 +165,9 @@ impl TuiApp {
                     ].as_ref())
                     .split(frame.area());
 
-                self.page_height = vertical_chunks[1].height - 2;
+                    self.list_height = vertical_chunks[0].height.saturating_sub(2) as usize;
+                    self.page_height = vertical_chunks[1].height.saturating_sub(2) as usize;
+
 
                 // Render path at top
                 let path_text = match self.view_mode {
@@ -124,26 +210,26 @@ impl TuiApp {
                     ViewMode::Keys => format!(" {} Keys:", self.app.current_keys.len()),
                 };
 
-                if self.app.current_keys.len() > 0 {
-                    let items: Vec<ListItem> = self.app
-                    .current_keys
-                    .iter()
-                    .enumerate()  
-                    .map(|(index, key)| { 
-                        if self.app.has_subkeys(index) {
-                            ListItem::new(format!("{} +", key))
+                let list_height = chunks[0].height.saturating_sub(2) as usize;
+
+                let items: Vec<ListItem> = keys
+                    .into_iter()
+                    .map(|entry| {
+                        if entry.has_children {
+                            ListItem::new(format!("{} +", entry.key))
                         } else {
-                            ListItem::new(key.as_str())
+                            ListItem::new(entry.key)
                         }
                     })
                     .collect();
 
+                if self.app.current_keys.len() > 0 {
                     let keys_list = List::new(items)
-                    .block(Block::default()
-                        .title(list_title)
-                        .borders(Borders::ALL))
+                        .block(Block::default()
+                            .title(format!(" {} Keys ", self.app.total_keys()))
+                            .borders(Borders::ALL))
                         .highlight_style(Style::default().reversed());
-                
+                    
                     frame.render_stateful_widget(keys_list, chunks[0], &mut self.list_state);
                 } else {
                     let tree_name = if let Some(tree) = &self.app.current_tree {
@@ -175,7 +261,7 @@ impl TuiApp {
 
                     self.max_horizontal_scroll = if !self.wrap_text {
                         lines.iter()
-                            .map(|line| line.len() as u16)
+                            .map(|line| line.len())
                             .max()
                             .unwrap_or(0)
                             .saturating_sub(visible_width)
@@ -252,7 +338,7 @@ impl TuiApp {
                                 };
                                 self.scroll_state = 0; // Reset scroll when switching panes
                             },
-                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
                                 if matches!(self.focused_pane, Pane::Value) {
                                     let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
                                     let movement = if shift_pressed { 10 } else { 1 };
@@ -271,29 +357,32 @@ impl TuiApp {
                                             self.horizontal_scroll = (self.horizontal_scroll + movement)
                                                 .min(self.max_horizontal_scroll);
                                         }
+                                        KeyCode::PageUp => {
+                                            if matches!(self.focused_pane, Pane::Value) {
+                                                self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
+                                            }
+                                        },
+                                        KeyCode::PageDown => {
+                                            if matches!(self.focused_pane, Pane::Value) {
+                                                self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
+                                            }
+                                        },
+                                        KeyCode::Home => {
+                                            if matches!(self.focused_pane, Pane::Value) {
+                                                self.scroll_state = 0;
+                                                self.horizontal_scroll = 0;
+                                            }
+                                        },
+                                        KeyCode::End => {
+                                            if matches!(self.focused_pane, Pane::Value) {
+                                                self.scroll_state = self.max_scroll;
+                                            }
+                                        },     
+            
                                         _ => {}
                                     }
                                 } else {
-                                    // Your existing list navigation for non-Value pane
-                                    match key.code {
-                                        KeyCode::Up => {
-                                            if let Some(selected) = self.list_state.selected() {
-                                                if selected > 0 {
-                                                    self.app.get_value(selected - 1)?;
-                                                    self.list_state.select(Some(selected - 1));
-                                                }
-                                            }
-                                        }
-                                        KeyCode::Down => {
-                                            if let Some(selected) = self.list_state.selected() {
-                                                if selected < self.app.current_keys.len().saturating_sub(1) {
-                                                    self.app.get_value(selected + 1)?;
-                                                    self.list_state.select(Some(selected + 1));
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
+                                    self.handle_list_navigation(key.code)?;
                                 }
                             }
                             KeyCode::Enter => {
@@ -341,27 +430,6 @@ impl TuiApp {
                                     self.list_state.select(Some(0));
                                 }
                             },
-                            KeyCode::PageUp => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
-                                }
-                            },
-                            KeyCode::PageDown => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
-                                }
-                            },
-                            KeyCode::Home => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    self.scroll_state = 0;
-                                    self.horizontal_scroll = 0;
-                                }
-                            },
-                            KeyCode::End => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    self.scroll_state = self.max_scroll;
-                                }
-                            },     
                             KeyCode::Char('w') => {
                                 if matches!(self.focused_pane, Pane::Value) {
                                     self.wrap_text = !self.wrap_text;
