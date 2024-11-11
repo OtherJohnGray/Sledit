@@ -20,7 +20,7 @@ pub struct TuiApp {
     view_mode: ViewMode,
     list_state: ListState,
     focused_pane: Pane,
-    scroll_state: usize,
+    scroll_state: u16,
     max_scroll: u16,
     page_height: u16,
     wrap_text: bool,
@@ -133,18 +133,18 @@ impl TuiApp {
                 }
             },
             KeyCode::PageDown => {
-                let max_offset = total_keys.saturating_sub(self.list_height);
+                let max_offset = total_keys.saturating_sub(self.list_height as usize);
                 if self.list_offset < max_offset {
                     // Move window down by visible_height or to end
-                    self.list_offset = (self.list_offset + self.list_height).min(max_offset);
+                    self.list_offset = (self.list_offset + self.list_height as usize).min(max_offset);
                     self.update_list()?;
-                    // Keep selection at top of new window
-                    self.list_state.select(Some(0));
-                    self.app.get_value(self.list_offset)?;
-                } else if relative_selection < self.list_items.len() - 1 {
+                    // Keep selection at bottom of new window
+                    self.list_state.select(Some(self.list_height as usize - 1));
+                    self.app.get_value(self.list_offset + self.list_height as usize - 1)?;
+                } else if relative_selection < self.list_height as usize - 1 {
                     // Already at bottom of data, just move selection to bottom of window
-                    self.list_state.select(Some(self.list_items.len() - 1));
-                    self.app.get_value(self.list_offset + self.list_items.len() - 1)?;
+                    self.list_state.select(Some(self.list_height as usize - 1));
+                    self.app.get_value(self.list_offset + self.list_height as usize - 1)?;
                 }
             },
             _ => {}
@@ -165,8 +165,8 @@ impl TuiApp {
                     ].as_ref())
                     .split(frame.area());
 
-                    self.list_height = vertical_chunks[0].height.saturating_sub(2) as usize;
-                    self.page_height = vertical_chunks[1].height.saturating_sub(2) as usize;
+                    self.list_height = vertical_chunks[0].height.saturating_sub(2);
+                    self.page_height = vertical_chunks[1].height.saturating_sub(2);
 
 
                 // Render path at top
@@ -205,25 +205,25 @@ impl TuiApp {
                     .split(vertical_chunks[1]);
 
                 
-                let list_title = match self.view_mode {
-                    ViewMode::Trees => format!(" {} Trees:", self.app.current_keys.len()),
-                    ViewMode::Keys => format!(" {} Keys:", self.app.current_keys.len()),
-                };
-
-                let list_height = chunks[0].height.saturating_sub(2) as usize;
-
-                let items: Vec<ListItem> = keys
-                    .into_iter()
-                    .map(|entry| {
-                        if entry.has_children {
-                            ListItem::new(format!("{} +", entry.key))
-                        } else {
-                            ListItem::new(entry.key)
-                        }
-                    })
-                    .collect();
-
-                if self.app.current_keys.len() > 0 {
+                if self.app.visible_keys().len() > 0 {
+                    let list_title = match self.view_mode {
+                        ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
+                        ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
+                    };
+    
+                    let list_height = chunks[0].height.saturating_sub(2) as usize;
+    
+                    let items: Vec<ListItem> = self.app.visible_keys()
+                        .into_iter()
+                        .map(|entry| {
+                            if entry.has_children {
+                                ListItem::new(format!("{} +", entry.key))
+                            } else {
+                                ListItem::new(entry.key)
+                            }
+                        })
+                        .collect();
+    
                     let keys_list = List::new(items)
                         .block(Block::default()
                             .title(format!(" {} Keys ", self.app.total_keys()))
@@ -244,7 +244,8 @@ impl TuiApp {
                     );
                 }
 
-                if let Some(value) = &self.app.current_value {
+                
+                if let Ok(Some(value)) = &self.app.get_value(self.list_state.selected().unwrap_or(0)) {
                     let content = String::from_utf8_lossy(value).to_string();
                     let lines: Vec<&str> = content.split('\n').collect();
                     let visible_width = chunks[1].width.saturating_sub(2);
@@ -264,7 +265,7 @@ impl TuiApp {
                             .map(|line| line.len())
                             .max()
                             .unwrap_or(0)
-                            .saturating_sub(visible_width)
+                            .saturating_sub(visible_width as usize) as u16
                     } else {
                         0
                     };
@@ -304,7 +305,7 @@ impl TuiApp {
                         value_widget
                     };
                     
-                    let value_widget = value_widget.scroll((self.scroll_state, self.horizontal_scroll));
+                    let value_widget = value_widget.scroll((self.scroll_state as u16, self.horizontal_scroll));
                 
 
                     frame.render_widget(value_widget, chunks[1]);
@@ -321,12 +322,7 @@ impl TuiApp {
                     Event::FocusLost => {},
                     Event::Mouse(_) => {},
                     Event::Resize(_,_) => {},                    
-                    Event::Paste(content) => {
-                        if matches!(self.focused_pane, Pane::Value) {
-                            self.app.current_value = Some(content.into_bytes());
-                            self.status_message = Some("Pasted content into current value".into());
-                        }
-                    },
+                    Event::Paste(content) => {},
                     Event::Key(key) => {
                         self.status_message = None;
                         match key.code {
@@ -391,24 +387,25 @@ impl TuiApp {
                                         ViewMode::Trees => {
                                             self.view_mode = ViewMode::Keys;
                                             self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
-                                            if self.app.current_keys.len() > 0 {
-                                                self.app.get_value(0)?;
-                                                self.list_state.select(Some(0));
-                                            } else {
-                                                self.list_state.select(None);
-                                            }
+                                            // if self.app.current_keys.len() > 0 {
+                                            //     self.app.get_value(0)?;
+                                            //     self.list_state.select(Some(0));
+                                            // } else {
+                                            //     self.list_state.select(None);
+                                            // }
                                         }
                                         ViewMode::Keys => {
                                             let index = self.list_state.selected().unwrap_or(0);
-                                            if self.app.has_subkeys(index) {
-                                                self.app.select_key(index)?;
-                                                if self.app.current_keys.len() > 0 {
-                                                    self.list_state.select(Some(0));
-                                                    self.app.get_value(0)?;
-                                                } else {
-                                                    self.list_state.select(None);
-                                                }
-                                            }
+                                            self.app.select_key(self.list_state.selected().unwrap_or(0))?;
+                                            // if self.app.has_subkeys(index) {
+                                            //     self.app.select_key(index)?;
+                                            //     if self.app.current_keys.len() > 0 {
+                                            //         self.list_state.select(Some(0));
+                                            //         self.app.get_value(0)?;
+                                            //     } else {
+                                            //         self.list_state.select(None);
+                                            //     }
+                                            // }
                                         }
                                     }
                                 }

@@ -1,6 +1,6 @@
 // file src/app.rs
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use sled::Db;
 use std::collections::BTreeMap;
 
@@ -10,7 +10,6 @@ pub struct App {
     pub sled_trees: Vec<String>,
     pub current_tree: Option<sled::Tree>,
     pub current_path: Vec<String>,
-    pub current_value: Option<Vec<u8>>,
     pub delimiter: Option<String>,
     cached_key_tree: Option<KeyTree>,
     current_key_range: (usize, Vec<KeyEntry>), // (offset, visible_keys)    
@@ -18,12 +17,10 @@ pub struct App {
 
 struct KeyTree {
     keys: BTreeMap<String, KeyNode>,
-    total_keys: usize,
 }
 
 struct KeyNode {
     children: BTreeMap<String, KeyNode>,
-    has_value: bool,
 }
 
 #[derive(Clone)]
@@ -39,7 +36,6 @@ impl App {
             sled_trees: vec![],
             current_tree: None,
             current_path: vec![],
-            current_value: None,
             delimiter: None,
             cached_key_tree: None,
             current_key_range: (0, Vec::new()),
@@ -52,7 +48,6 @@ impl App {
             if let Some(delimiter) = &self.delimiter {
                 let mut key_tree = KeyTree {
                     keys: BTreeMap::new(),
-                    total_keys: 0,
                 };
 
                 for result in tree.iter() {
@@ -61,44 +56,38 @@ impl App {
                     let parts: Vec<&str> = key_str.split(delimiter).collect();
                     
                     let mut current = &mut key_tree.keys;
-                    for (i, part) in parts.iter().enumerate() {
-                        let is_last = i == parts.len() - 1;
+                    for part in parts.iter() {
                         let entry = current.entry(part.to_string()).or_insert_with(|| KeyNode {
                             children: BTreeMap::new(),
-                            has_value: false,
                         });
-                        if is_last {
-                            entry.has_value = true;
-                        }
                         current = &mut entry.children;
                     }
                 }
-                key_tree.total_keys = self.count_visible_keys(&key_tree)?;
                 self.cached_key_tree = Some(key_tree);
             }
         }
         Ok(())
     }
 
-    fn count_visible_keys(&self, tree: &KeyTree) -> Result<usize> {
-        if self.delimiter.is_none() {
-            if let Some(tree) = &self.current_tree {
-                Ok(tree.len() as usize)
-            } else {
-                Ok(0)
-            }
-        } else {
-            let mut current = &tree.keys;
-            for path_segment in &self.current_path {
-                if let Some(node) = current.get(path_segment) {
-                    current = &node.children;
-                } else {
-                    return Ok(0);
-                }
-            }
-            Ok(current.len())
-        }
-    }
+    // fn count_visible_keys(&self, tree: &KeyTree) -> Result<usize> {
+    //     if self.delimiter.is_none() {
+    //         if let Some(tree) = &self.current_tree {
+    //             Ok(tree.len() as usize)
+    //         } else {
+    //             Ok(0)
+    //         }
+    //     } else {
+    //         let mut current = &tree.keys;
+    //         for path_segment in &self.current_path {
+    //             if let Some(node) = current.get(path_segment) {
+    //                 current = &node.children;
+    //             } else {
+    //                 return Ok(0);
+    //             }
+    //         }
+    //         Ok(current.len())
+    //     }
+    // }
 
     pub fn get_keys_range(&mut self, offset: usize, count: usize) -> Result<Vec<KeyEntry>> {
         if self.delimiter.is_none() {
@@ -180,7 +169,16 @@ impl App {
         if let Some(db) = &self.db {
             self.current_tree = Some(db.open_tree(&self.sled_trees[index])?);
             self.current_path.clear();
-            // self.refresh_keys()?;
+            if self.delimiter.is_some() {
+                self.build_key_tree();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn select_key(&mut self, index: usize) -> Result<()> {
+        if self.current_tree.is_some() {
+            self.current_path.push(self.current_key_range.1[index].key.clone());
         }
         Ok(())
     }
@@ -232,7 +230,11 @@ impl App {
     //     Ok(())
     // }
 
-    pub fn get_value(&mut self, index: usize) -> Result<()> {
+    pub fn visible_keys(&self) -> Vec<KeyEntry> {
+        self.current_key_range.1.clone()
+    }
+
+    pub fn get_value(&mut self, index: usize) -> Result<Option<Vec<u8>>, Error> {
         if let Some(tree) = &self.current_tree {
             let key = self.current_key_range.1[index].to_owned();
             let mut new_path = self.current_path.clone();
@@ -240,17 +242,16 @@ impl App {
             let full_key = new_path.join("/");
             let value = tree.get(full_key.as_bytes())?;
             if let Some(value) = value {
-                self.current_value = Some(value.to_vec());
+                return Ok(Some(value.to_vec()));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
 
     pub fn go_back_in_path(&mut self) -> Result<()> {
         if !self.current_path.is_empty() && self.current_path.len() > 1 {
             self.current_path.pop();
-            self.current_value = None;
         } 
         Ok(())
     }
