@@ -4,11 +4,8 @@ use crate::app::*;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
-    layout::{Constraint, Direction, Layout}, 
-    style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph}, 
-    DefaultTerminal,
-    prelude::Stylize,
+    layout::{Constraint, Direction, Layout, Rect}, prelude::Stylize, style::{Color, Style}, widgets::{Block, Borders, List, ListItem, ListState, Paragraph}, 
+    DefaultTerminal, Frame
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,7 +72,7 @@ impl TuiApp {
 
     fn update_list(&mut self) -> Result<()> {
         // Get just enough items to fill the visible area
-        self.app.get_keys_range(self.list_offset, self.list_height as usize)?;
+        self.app.set_key_range(self.list_offset, self.list_height as usize)?;
         Ok(())
     }
 
@@ -100,8 +97,6 @@ impl TuiApp {
                         self.list_offset = self.list_offset.saturating_sub(1);
                         self.update_list()?;
                     }
-                    // Update the value display
-                    self.app.get_value(self.list_offset + self.list_state.selected().unwrap_or(0))?;
                 }
             },
             KeyCode::Down => {
@@ -114,8 +109,6 @@ impl TuiApp {
                         self.list_offset += 1;
                         self.update_list()?;
                     }
-                    // Update the value display
-                    self.app.get_value(self.list_offset + self.list_state.selected().unwrap_or(0))?;
                 }
             },
             KeyCode::PageUp => {
@@ -125,11 +118,9 @@ impl TuiApp {
                     self.update_list()?;
                     // Keep selection at top of new window
                     self.list_state.select(Some(0));
-                    self.app.get_value(self.list_offset)?;
                 } else if relative_selection > 0 {
                     // Already at top of data, just move selection to top of window
                     self.list_state.select(Some(0));
-                    self.app.get_value(0)?;
                 }
             },
             KeyCode::PageDown => {
@@ -140,11 +131,9 @@ impl TuiApp {
                     self.update_list()?;
                     // Keep selection at bottom of new window
                     self.list_state.select(Some(self.list_height as usize - 1));
-                    self.app.get_value(self.list_offset + self.list_height as usize - 1)?;
                 } else if relative_selection < self.list_height as usize - 1 {
                     // Already at bottom of data, just move selection to bottom of window
                     self.list_state.select(Some(self.list_height as usize - 1));
-                    self.app.get_value(self.list_offset + self.list_height as usize - 1)?;
                 }
             },
             _ => {}
@@ -155,287 +144,332 @@ impl TuiApp {
 
     pub fn run(&mut self, running: Arc<AtomicBool>) -> Result<()> {
         loop {
-            self.terminal.draw(|frame| {
-                let vertical_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),  // Path display
-                        Constraint::Min(0),     // Main content
-                        Constraint::Length(1),  // info bar
-                    ].as_ref())
-                    .split(frame.area());
+            self.draw()?;
+            self.handle_input(running.clone())?;
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        Ok(())
+    }
 
-                    self.list_height = vertical_chunks[0].height.saturating_sub(2);
-                    self.page_height = vertical_chunks[1].height.saturating_sub(2);
+    fn draw(&mut self) -> Result<()> {
+        self.terminal.draw(|frame| {
+            let vertical_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),  // Path display
+                    Constraint::Min(0),     // Main content
+                    Constraint::Length(1),  // info bar
+                ].as_ref())
+                .split(frame.area());
+
+                self.list_height = vertical_chunks[0].height.saturating_sub(2);
+                self.page_height = vertical_chunks[1].height.saturating_sub(2);
 
 
-                // Render path at top
-                let path_text = match self.view_mode {
-                    ViewMode::Trees => "Select Tree".to_string(),
-                    ViewMode::Keys => {
-                        let tree_name = if let Some(tree) = &self.app.current_tree {
-                            String::from_utf8_lossy(&tree.name()).to_string()
+            // Render path at top
+            let path_text = match self.view_mode {
+                ViewMode::Trees => "Select Tree".to_string(),
+                ViewMode::Keys => {
+                    let tree_name = if let Some(tree) = &self.app.current_tree {
+                        String::from_utf8_lossy(&tree.name()).to_string()
+                    } else {
+                        "default".to_string()
+                    };
+                    format!("Tree: {} | Path: /{}", tree_name, self.app.current_path.join("/"))
+                }
+            };
+            
+            let path_widget = Paragraph::new(path_text)
+                .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(path_widget, vertical_chunks[0]);
+
+
+            // render info bar
+            if let Some(message) = &self.status_message {
+                frame.render_widget(Paragraph::new(message.to_owned()), vertical_chunks[2]);
+            } else {
+                let key_help = match self.focused_pane {
+                    Pane::List =>   "q)uit - [enter] show subkeys - [backspace] show parent key - ↓↑ select key - [tab] select value pane - ←→ resize panes",
+                    Pane::Value =>  "↓↑←→ scroll - [shift] x10 - [tab] select key pane - e)dit"
+                };
+                frame.render_widget(Paragraph::new(key_help), vertical_chunks[2]);
+
+            }
+
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+                .split(vertical_chunks[1]);
+
+
+            // render tree or key list
+            match self.view_mode {
+                ViewMode::Trees => {
+                    self.draw_tree_list(&frame, chunks[0]);
+                }
+                ViewMode::Keys => {
+                    self.draw_key_list(&frame, chunks[0]);
+                }
+            }
+
+
+            
+            if let Ok(Some(value)) = &self.app.get_value(self.list_state.selected().unwrap_or(0)) {
+                let content = String::from_utf8_lossy(value).to_string();
+                let lines: Vec<&str> = content.split('\n').collect();
+                let visible_width = chunks[1].width.saturating_sub(2);
+
+                let total_lines = if self.wrap_text {
+                    calculate_wrapped_lines(&content, visible_width)
+                } else {
+                    content.split('\n').count()
+                };
+
+                // Calculate max scroll based on total wrapped lines
+                self.max_scroll = total_lines.saturating_sub(self.page_height as usize) as u16;
+                self.scroll_state = self.scroll_state.min(self.max_scroll);
+
+                self.max_horizontal_scroll = if !self.wrap_text {
+                    lines.iter()
+                        .map(|line| line.len())
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(visible_width as usize) as u16
+                } else {
+                    0
+                };
+                self.horizontal_scroll = self.horizontal_scroll.min(self.max_horizontal_scroll);
+
+                let wrap_indicator = if self.wrap_text { "W" } else { "NW" };
+                let scroll_indicator = if self.max_scroll > 0 {
+                    format!(" [{}/{}]", self.scroll_state + 1, self.max_scroll + 1)
+                } else {
+                    String::new()
+                };
+                let h_scroll_indicator = if !self.wrap_text && self.max_horizontal_scroll > 0 {
+                    format!(" <{}>", self.horizontal_scroll)
+                } else {
+                    String::new()
+                };                    
+
+                let value_widget = Paragraph::new(content)
+                .block(Block::default()
+                    .title(format!("Value [{}]{}{}", 
+                        wrap_indicator, 
+                        scroll_indicator,
+                        h_scroll_indicator
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(
+                        if matches!(self.focused_pane, Pane::Value) {
+                            Color::Blue
                         } else {
-                            "default".to_string()
-                        };
-                        format!("Tree: {} | Path: /{}", tree_name, self.app.current_path.join("/"))
-                    }
+                            Color::White
+                        }
+                    )));
+            
+                let value_widget = if self.wrap_text {
+                    value_widget.wrap(ratatui::widgets::Wrap { trim: false })
+                } else {
+                    value_widget
                 };
                 
-                let path_widget = Paragraph::new(path_text)
-                    .block(Block::default().borders(Borders::ALL));
-                frame.render_widget(path_widget, vertical_chunks[0]);
-
-
-                // render info bar
-                if let Some(message) = &self.status_message {
-                    frame.render_widget(Paragraph::new(message.to_owned()), vertical_chunks[2]);
-                } else {
-                    let key_help = match self.focused_pane {
-                        Pane::List =>   "q)uit - [enter] show subkeys - [backspace] show parent key - ↓↑ select key - [tab] select value pane - ←→ resize panes",
-                        Pane::Value =>  "↓↑←→ scroll - [shift] x10 - [tab] select key pane - e)dit"
-                    };
-                    frame.render_widget(Paragraph::new(key_help), vertical_chunks[2]);
-
-                }
-
-                let chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-                    .split(vertical_chunks[1]);
-
-                
-                if self.app.visible_keys().len() > 0 {
-                    let list_title = match self.view_mode {
-                        ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
-                        ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
-                    };
-    
-                    let list_height = chunks[0].height.saturating_sub(2) as usize;
-    
-                    let items: Vec<ListItem> = self.app.visible_keys()
-                        .into_iter()
-                        .map(|entry| {
-                            if entry.has_children {
-                                ListItem::new(format!("{} +", entry.key))
-                            } else {
-                                ListItem::new(entry.key)
-                            }
-                        })
-                        .collect();
-    
-                    let keys_list = List::new(items)
-                        .block(Block::default()
-                            .title(format!(" {} Keys ", self.app.total_keys()))
-                            .borders(Borders::ALL))
-                        .highlight_style(Style::default().reversed());
-                    
-                    frame.render_stateful_widget(keys_list, chunks[0], &mut self.list_state);
-                } else {
-                    let tree_name = if let Some(tree) = &self.app.current_tree {
-                        &String::from_utf8_lossy(&tree.name()).into_owned()
-                    } else {
-                        "Default"
-                    };
-
-                    frame.render_widget(
-                        Paragraph::new(format!("No Keys found in tree {}", &tree_name)), // assume key mode if we got here, since there is always a Default item in trees list.
-                        chunks[0]
-                    );
-                }
-
-                
-                if let Ok(Some(value)) = &self.app.get_value(self.list_state.selected().unwrap_or(0)) {
-                    let content = String::from_utf8_lossy(value).to_string();
-                    let lines: Vec<&str> = content.split('\n').collect();
-                    let visible_width = chunks[1].width.saturating_sub(2);
-
-                    let total_lines = if self.wrap_text {
-                        calculate_wrapped_lines(&content, visible_width)
-                    } else {
-                        content.split('\n').count()
-                    };
-
-                    // Calculate max scroll based on total wrapped lines
-                    self.max_scroll = total_lines.saturating_sub(self.page_height as usize) as u16;
-                    self.scroll_state = self.scroll_state.min(self.max_scroll);
-
-                    self.max_horizontal_scroll = if !self.wrap_text {
-                        lines.iter()
-                            .map(|line| line.len())
-                            .max()
-                            .unwrap_or(0)
-                            .saturating_sub(visible_width as usize) as u16
-                    } else {
-                        0
-                    };
-                    self.horizontal_scroll = self.horizontal_scroll.min(self.max_horizontal_scroll);
-
-                    let wrap_indicator = if self.wrap_text { "W" } else { "NW" };
-                    let scroll_indicator = if self.max_scroll > 0 {
-                        format!(" [{}/{}]", self.scroll_state + 1, self.max_scroll + 1)
-                    } else {
-                        String::new()
-                    };
-                    let h_scroll_indicator = if !self.wrap_text && self.max_horizontal_scroll > 0 {
-                        format!(" <{}>", self.horizontal_scroll)
-                    } else {
-                        String::new()
-                    };                    
-
-                    let value_widget = Paragraph::new(content)
-                    .block(Block::default()
-                        .title(format!("Value [{}]{}{}", 
-                            wrap_indicator, 
-                            scroll_indicator,
-                            h_scroll_indicator
-                        ))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(
-                            if matches!(self.focused_pane, Pane::Value) {
-                                Color::Blue
-                            } else {
-                                Color::White
-                            }
-                        )));
-                
-                    let value_widget = if self.wrap_text {
-                        value_widget.wrap(ratatui::widgets::Wrap { trim: false })
-                    } else {
-                        value_widget
-                    };
-                    
-                    let value_widget = value_widget.scroll((self.scroll_state as u16, self.horizontal_scroll));
-                
-
-                    frame.render_widget(value_widget, chunks[1]);
-                }
-
-            })?;
-
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if !running.load(Ordering::SeqCst) {
-                    break;
-                }
-                match event::read()? {
-                    Event::FocusGained => {},
-                    Event::FocusLost => {},
-                    Event::Mouse(_) => {},
-                    Event::Resize(_,_) => {},                    
-                    Event::Paste(content) => {},
-                    Event::Key(key) => {
-                        self.status_message = None;
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Tab => {
-                                self.focused_pane = match self.focused_pane {
-                                    Pane::List => Pane::Value,
-                                    Pane::Value => Pane::List,
-                                };
-                                self.scroll_state = 0; // Reset scroll when switching panes
-                            },
-                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
-                                    let movement = if shift_pressed { 10 } else { 1 };
-                                    
-                                    match key.code {
-                                        KeyCode::Up => {
-                                            self.scroll_state = self.scroll_state.saturating_sub(movement);
-                                        }
-                                        KeyCode::Down => {
-                                            self.scroll_state = (self.scroll_state + movement).min(self.max_scroll);
-                                        }
-                                        KeyCode::Left if !self.wrap_text => {
-                                            self.horizontal_scroll = self.horizontal_scroll.saturating_sub(movement);
-                                        }
-                                        KeyCode::Right if !self.wrap_text => {
-                                            self.horizontal_scroll = (self.horizontal_scroll + movement)
-                                                .min(self.max_horizontal_scroll);
-                                        }
-                                        KeyCode::PageUp => {
-                                            if matches!(self.focused_pane, Pane::Value) {
-                                                self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
-                                            }
-                                        },
-                                        KeyCode::PageDown => {
-                                            if matches!(self.focused_pane, Pane::Value) {
-                                                self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
-                                            }
-                                        },
-                                        KeyCode::Home => {
-                                            if matches!(self.focused_pane, Pane::Value) {
-                                                self.scroll_state = 0;
-                                                self.horizontal_scroll = 0;
-                                            }
-                                        },
-                                        KeyCode::End => {
-                                            if matches!(self.focused_pane, Pane::Value) {
-                                                self.scroll_state = self.max_scroll;
-                                            }
-                                        },     
+                let value_widget = value_widget.scroll((self.scroll_state as u16, self.horizontal_scroll));
             
-                                        _ => {}
-                                    }
-                                } else {
-                                    self.handle_list_navigation(key.code)?;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if matches!(self.focused_pane, Pane::List) {
-                                    match self.view_mode {
-                                        ViewMode::Trees => {
-                                            self.view_mode = ViewMode::Keys;
-                                            self.app.select_tree(self.list_state.selected().unwrap_or(0))?;
-                                            // if self.app.current_keys.len() > 0 {
-                                            //     self.app.get_value(0)?;
-                                            //     self.list_state.select(Some(0));
-                                            // } else {
-                                            //     self.list_state.select(None);
-                                            // }
-                                        }
-                                        ViewMode::Keys => {
-                                            let index = self.list_state.selected().unwrap_or(0);
-                                            self.app.select_key(self.list_state.selected().unwrap_or(0))?;
-                                            // if self.app.has_subkeys(index) {
-                                            //     self.app.select_key(index)?;
-                                            //     if self.app.current_keys.len() > 0 {
-                                            //         self.list_state.select(Some(0));
-                                            //         self.app.get_value(0)?;
-                                            //     } else {
-                                            //         self.list_state.select(None);
-                                            //     }
-                                            // }
-                                        }
-                                    }
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                self.focused_pane = Pane::List;
-                                if self.app.current_path.len() > 1 {
-                                    self.app.go_back_in_path()?;
-                                    if self.app.current_keys.len() > 0 {
-                                        self.app.get_value(0)?;
-                                        self.list_state.select(Some(0));    
-                                    } else {
-                                        self.list_state.select(None);
-                                    }
-                                } else { // go back to tree mode, assume at least Default tree available
-                                    self.view_mode = ViewMode::Trees;
-                                    self.app.refresh_trees()?;
-                                    self.app.current_value = None;
-                                    self.list_state.select(Some(0));
-                                }
-                            },
-                            KeyCode::Char('w') => {
-                                if matches!(self.focused_pane, Pane::Value) {
-                                    self.wrap_text = !self.wrap_text;
-                                    self.horizontal_scroll = 0;
-                                }
-                            },
 
-                            _ => {}
+                frame.render_widget(value_widget, chunks[1]);
+            }
+
+        })?;
+        Ok(())
+    }
+
+
+
+    fn draw_tree_list(&mut self, frame: &Frame, area: Rect) {
+        if self.app.sled_trees.len() > 0 {
+            // let list_title = match self.view_mode {
+            //     ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
+            //     ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
+            // };
+
+            // let list_height = chunks[0].height.saturating_sub(2) as usize;
+
+            let items: Vec<ListItem> = self.app.current_key_range.keys.clone()
+                .into_iter()
+                .map(|entry| {
+                    if entry.has_children {
+                        ListItem::new(format!("{} +", entry.key))
+                    } else {
+                        ListItem::new(entry.key)
+                    }
+                })
+                .collect();
+
+            let keys_list = List::new(items)
+                .block(Block::default()
+                    .title(format!(" {} Keys ", self.app.total_keys()))
+                    .borders(Borders::ALL))
+                .highlight_style(Style::default().reversed());
+            
+            frame.render_stateful_widget(keys_list, area, &mut self.list_state);
+        } else {
+            let db_name = if let Some(db) = self.app.db { 
+                String::from_utf8_lossy(db.name().to_bytes);
+            } else { 
+                "nil".to_owned()
+            };
+            frame.render_widget( Paragraph::new(format!("Could not retrieve tree list from database. This is probably a corrupt database or a bug", &self.app.db.unwrap_or(default).name())), area );
+        }
+    }
+
+
+    fn draw_key_list(&mut self, frame: &Frame, area: Rect) {
+        if self.app.current_key_range.keys.len() > 0 {
+            // let list_title = match self.view_mode {
+            //     ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
+            //     ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
+            // };
+
+            // let list_height = chunks[0].height.saturating_sub(2) as usize;
+
+            let items: Vec<ListItem> = self.app.current_key_range.keys.clone()
+                .into_iter()
+                .map(|entry| {
+                    if entry.has_children {
+                        ListItem::new(format!("{} +", entry.key))
+                    } else {
+                        ListItem::new(entry.key)
+                    }
+                })
+                .collect();
+
+            let keys_list = List::new(items)
+                .block(Block::default()
+                    .title(format!(" {} Keys ", self.app.total_keys()))
+                    .borders(Borders::ALL))
+                .highlight_style(Style::default().reversed());
+            
+            frame.render_stateful_widget(keys_list, area, &mut self.list_state);
+        } else {
+            let tree_name = if let Some(tree) = &self.app.current_tree {
+                &String::from_utf8_lossy(&tree.name()).into_owned()
+            } else {
+                "Default"
+            };
+
+            frame.render_widget( Paragraph::new(format!("No Keys found in tree {}", &tree_name)), area );
+        }
+    }
+
+
+    fn handle_input(&mut self, running: Arc<AtomicBool>) -> Result<()> {
+        if event::poll(std::time::Duration::from_millis(100))? {
+            match event::read()? {
+                Event::FocusGained => {},
+                Event::FocusLost => {},
+                Event::Mouse(_) => {},
+                Event::Resize(_,_) => {},                    
+                Event::Paste(_) => {},
+                Event::Key(key) => {
+                    self.status_message = None;
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            running.store(false, Ordering::SeqCst);
+                        },
+                        KeyCode::Tab => {
+                            self.focused_pane = match self.focused_pane {
+                                Pane::List => Pane::Value,
+                                Pane::Value => Pane::List,
+                            };
+                            self.scroll_state = 0; // Reset scroll when switching panes
+                        },
+                        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                let shift_pressed = key.modifiers.contains(event::KeyModifiers::SHIFT);
+                                let movement = if shift_pressed { 10 } else { 1 };
+                                
+                                match key.code {
+                                    KeyCode::Up => {
+                                        self.scroll_state = self.scroll_state.saturating_sub(movement);
+                                    }
+                                    KeyCode::Down => {
+                                        self.scroll_state = (self.scroll_state + movement).min(self.max_scroll);
+                                    }
+                                    KeyCode::Left if !self.wrap_text => {
+                                        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(movement);
+                                    }
+                                    KeyCode::Right if !self.wrap_text => {
+                                        self.horizontal_scroll = (self.horizontal_scroll + movement)
+                                            .min(self.max_horizontal_scroll);
+                                    }
+                                    KeyCode::PageUp => {
+                                        if matches!(self.focused_pane, Pane::Value) {
+                                            self.scroll_state = self.scroll_state.saturating_sub(self.page_height.saturating_sub(1));
+                                        }
+                                    },
+                                    KeyCode::PageDown => {
+                                        if matches!(self.focused_pane, Pane::Value) {
+                                            self.scroll_state = (self.scroll_state + self.page_height.saturating_sub(1)).min(self.max_scroll);
+                                        }
+                                    },
+                                    KeyCode::Home => {
+                                        if matches!(self.focused_pane, Pane::Value) {
+                                            self.scroll_state = 0;
+                                            self.horizontal_scroll = 0;
+                                        }
+                                    },
+                                    KeyCode::End => {
+                                        if matches!(self.focused_pane, Pane::Value) {
+                                            self.scroll_state = self.max_scroll;
+                                        }
+                                    },     
+        
+                                    _ => {}
+                                }
+                            } else {
+                                self.handle_list_navigation(key.code)?;
+                            }
                         }
+                        KeyCode::Enter => {
+                            if matches!(self.focused_pane, Pane::List) {
+                                let index = self.list_state.selected().unwrap_or(0);
+                                match self.view_mode {
+                                    ViewMode::Trees => {
+                                        self.view_mode = ViewMode::Keys;
+                                        self.app.select_tree(index)?;
+                                        self.app.set_key_range(0, self.list_height as usize)?;
+                                    }
+                                    ViewMode::Keys => {
+                                        if self.app.delimiter.is_some() {
+                                            if self.app.current_key_range.keys[index].has_children {
+                                                self.app.select_key(index)?;
+
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            self.focused_pane = Pane::List;
+                            if self.app.current_path.len() > 1 {
+                                self.app.go_back_in_path()?;
+                            } else { // go back to tree mode, assume at least Default tree available
+                                self.view_mode = ViewMode::Trees;
+                            }
+                            self.list_state.select(Some(0));
+                        },
+                        KeyCode::Char('w') => {
+                            if matches!(self.focused_pane, Pane::Value) {
+                                self.wrap_text = !self.wrap_text;
+                                self.horizontal_scroll = 0;
+                            }
+                        },
+
+                        _ => {}
                     }
                 }
             }

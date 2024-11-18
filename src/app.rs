@@ -9,10 +9,14 @@ pub struct App {
     pub db: Option<Db>,
     pub sled_trees: Vec<String>,
     pub current_tree: Option<sled::Tree>,
-    pub current_path: Vec<String>,
+    pub current_path: Vec<String>, // current path within cached_key_tree
     pub delimiter: Option<String>,
     cached_key_tree: Option<KeyTree>,
-    current_key_range: (usize, Vec<KeyEntry>), // (offset, visible_keys)    
+    // current_key_range represents the keys to display in the left panel.
+    // If no delimiter, offset and range are within set of all keys in the sled tree
+    // if delimiter, offset and range are within the branch of cached_key_tree that is 
+    // identified by current_path
+    pub current_key_range: KeyRange, // (offset, visible_keys)   
 }
 
 struct KeyTree {
@@ -29,6 +33,11 @@ pub struct KeyEntry {
     pub has_children: bool,
 }
 
+pub struct  KeyRange {
+    pub offset: usize,
+    pub keys: Vec<KeyEntry>,
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -38,7 +47,7 @@ impl App {
             current_path: vec![],
             delimiter: None,
             cached_key_tree: None,
-            current_key_range: (0, Vec::new()),
+            current_key_range: KeyRange{ offset: 0, keys: vec![] },
         }
     }
 
@@ -69,27 +78,9 @@ impl App {
         Ok(())
     }
 
-    // fn count_visible_keys(&self, tree: &KeyTree) -> Result<usize> {
-    //     if self.delimiter.is_none() {
-    //         if let Some(tree) = &self.current_tree {
-    //             Ok(tree.len() as usize)
-    //         } else {
-    //             Ok(0)
-    //         }
-    //     } else {
-    //         let mut current = &tree.keys;
-    //         for path_segment in &self.current_path {
-    //             if let Some(node) = current.get(path_segment) {
-    //                 current = &node.children;
-    //             } else {
-    //                 return Ok(0);
-    //             }
-    //         }
-    //         Ok(current.len())
-    //     }
-    // }
-
-    pub fn get_keys_range(&mut self, offset: usize, count: usize) -> Result<Vec<KeyEntry>> {
+    // Get a range of keys, either from the cached_key_tree (if delimiter) or the DB (if not),
+    // and cache it in current_key_range so it can be used to render and to reference keys by index. 
+    pub fn set_key_range(&mut self, offset: usize, count: usize) -> Result<()> {
         if self.delimiter.is_none() {
             // Use sled's range functionality for flat key list
             if let Some(tree) = &self.current_tree {
@@ -101,20 +92,20 @@ impl App {
                         has_children: false,
                     });
                 }
-                self.current_key_range = (offset, keys.clone());
-                Ok(keys)
+                self.current_key_range = KeyRange{offset, keys};
             } else {
-                Ok(Vec::new())
+                self.current_key_range = KeyRange{offset: 0, keys: vec![]};
             }
         } else {
-            // Use cached tree for hierarchical keys
+            // Use cached key tree for hierarchical keys
+            // the key tree is cached when the sled tree is first selected
             if let Some(tree) = &self.cached_key_tree {
                 let mut current = &tree.keys;
                 for path_segment in &self.current_path {
                     if let Some(node) = current.get(path_segment) {
                         current = &node.children;
                     } else {
-                        return Ok(Vec::new());
+                        self.current_key_range = KeyRange{offset: 0, keys: vec![]};
                     }
                 }
 
@@ -127,31 +118,33 @@ impl App {
                         has_children: !v.children.is_empty(),
                     })
                     .collect();
-
-                self.current_key_range = (offset, keys.clone());
-                Ok(keys)
-            } else {
-                Ok(Vec::new())
+                    self.current_key_range = KeyRange{offset, keys};
+                } else {
+                self.current_key_range = KeyRange{offset: 0, keys: vec![]};
             }
         }
+        Ok(())
     }
 
+
+    // Total number of keys that can be scrolled in the left pane
     pub fn total_keys(&self) -> usize {
-        if let Some(tree) = &self.cached_key_tree {
-            let mut current = &tree.keys;
-            for path_segment in &self.current_path {
-                if let Some(node) = current.get(path_segment) {
-                    current = &node.children;
-                } else {
-                    return 0;
-                }
+        if self.current_tree.is_none() { return 0 }
+        if self.delimiter.is_none() { return (self.current_tree.as_ref().expect("This is a bug. There should be a guard clause immediately before this.")).len() }
+        if self.cached_key_tree.is_none() { return 0 }
+        let mut current = &self.cached_key_tree.as_ref().expect("This is a bug. There should be a guard clause immediately before this.").keys;
+        for path_segment in &self.current_path {
+            if let Some(node) = current.get(path_segment) {
+                current = &node.children;
+            } else {
+                return 0;
             }
-            current.iter().count()
-        } else {
-            0
         }
+        current.iter().count()
     }        
 
+
+    // Refresh the list of sled trees that are available for selection in this DB
     pub fn refresh_trees(&mut self) -> Result<()> {
         if let Some(db) = &self.db {
             let mut trees: Vec<String> = db.tree_names()
@@ -165,78 +158,32 @@ impl App {
     }
 
 
+    // Select a particular sled tree and cache a tree of it's hierarchical keys if a delimiter is set
     pub fn select_tree(&mut self, index: usize) -> Result<()> {
         if let Some(db) = &self.db {
             self.current_tree = Some(db.open_tree(&self.sled_trees[index])?);
             self.current_path.clear();
             if self.delimiter.is_some() {
-                self.build_key_tree();
+                self.build_key_tree()?;
             }
         }
         Ok(())
     }
 
+
+    // Navigate down the key hierachy - should only be used if a delimiter is set
     pub fn select_key(&mut self, index: usize) -> Result<()> {
-        if self.current_tree.is_some() {
-            self.current_path.push(self.current_key_range.1[index].key.clone());
+        if self.current_tree.is_some() && self.delimiter.is_some() {
+            self.current_path.push(self.current_key_range.keys[index].key.clone());
         }
         Ok(())
-    }
+    }    
 
-    // pub fn refresh_keys(&mut self) -> Result<()> {
-    //     if let Some(tree) = &self.current_tree {
-    //         let prefix = if self.current_path.len() > 0 {
-    //             &format!("{}/", self.current_path.join("/"))
-    //         } else {
-    //             ""
-    //         };
-    //         let mut keys = Vec::new();
-    //         let iter = tree.scan_prefix(prefix.as_bytes());
-    //         for item in iter {
-    //             let (key, _value) = item?;
-    //             let key_str = String::from_utf8_lossy(&key).to_string();
-    //             if let Some(next_segment) = key_str
-    //                 .strip_prefix(&prefix)
-    //                 .and_then(|s| s.split('/').next())
-    //             {
-    //                 if ! keys.contains(&next_segment.to_string()) {
-    //                     keys.push(next_segment.to_string());
-    //                 }
-    //             }
-    //         }
-    //         self.current_keys = keys;
-    //     }
-    //     Ok(())
-    // }
 
-    // pub fn has_subkeys(&self, index: usize ) -> bool {
-    //     if let Some(tree) = &self.current_tree {
-    //         let key = &self.current_keys[index];
-    //         let path = if self.current_path.len() > 0 {
-    //                 format!("{}/{}/", self.current_path.join("/"), key)
-    //             } else {
-    //                 format!("{}/", key)
-    //             };
-    //         return tree.scan_prefix(path.as_bytes()).count() > 0;
-    //     }
-    //     return false;
-    // }
-
-    // pub fn select_key(&mut self, index: usize) -> Result<()> {
-    //     if self.has_subkeys(index) {
-    //         self.current_path.push(self.current_keys[index].to_owned());
-    //         self.refresh_keys()?;
-    //     }
-    //     Ok(())
-    // }
-
-    pub fn visible_keys(&self) -> Vec<KeyEntry> {
-        self.current_key_range.1.clone()
-    }
-
+    // get the value associated with a particular current key
     pub fn get_value(&mut self, index: usize) -> Result<Option<Vec<u8>>, Error> {
         if let Some(tree) = &self.current_tree {
-            let key = self.current_key_range.1[index].to_owned();
+            let key = self.current_key_range.keys[index].to_owned();
             let mut new_path = self.current_path.clone();
             new_path.push(key.key);
             let full_key = new_path.join("/");
@@ -249,6 +196,7 @@ impl App {
     }
 
 
+    // Remove elements from the current path to navigate back up the key hierachy
     pub fn go_back_in_path(&mut self) -> Result<()> {
         if !self.current_path.is_empty() && self.current_path.len() > 1 {
             self.current_path.pop();
