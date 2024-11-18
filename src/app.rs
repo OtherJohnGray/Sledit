@@ -178,6 +178,7 @@ impl App {
     pub fn select_key(&mut self, index: usize) -> Result<()> {
         if self.current_tree.is_some() && self.delimiter.is_some() {
             self.current_path.push(self.current_key_range.keys[index].key.clone());
+            self.total_keys = self.total_keys();
         }
         Ok(())
     }    
@@ -205,6 +206,7 @@ impl App {
     pub fn go_back_in_path(&mut self) -> Result<()> {
         if !self.current_path.is_empty() && self.current_path.len() > 1 {
             self.current_path.pop();
+            self.total_keys = self.total_keys();
         } 
         Ok(())
     }

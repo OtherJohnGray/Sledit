@@ -82,7 +82,7 @@ pub fn create_example_db(path: &Path, running: Arc<AtomicBool>) -> Result<()> {
             tree_pb.set_position(i);
             for j in 1..=50 {
                 for k in 1..=50 {
-                    let key = format!("key{0}{1}{0}subkey{2}{0}sub-subkey{3}", 
+                    let key = format!("key{1}{0}subkey{2}{0}subsubkey{3}", 
                         delimiter, i, j, k);
                     
                     let data = ExampleData {

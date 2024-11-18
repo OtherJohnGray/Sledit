@@ -44,10 +44,12 @@ impl TuiApp {
     pub fn new(db_path: PathBuf) -> Result<Self> {
         let mut terminal = ratatui::init();
         terminal.clear()?;
+        println!("Opening database....");
+        let mut app = App::new();
+        terminal.clear()?;
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         
-        let mut app = App::new();
         app.db = Some(sled::open(db_path)?);
         app.refresh_trees()?;
 
@@ -119,7 +121,8 @@ impl TuiApp {
                 frame.render_widget(Paragraph::new(message.to_owned()), vertical_chunks[2]);
             } else {
                 let key_help = match self.focused_pane {
-                    Pane::List =>   "q)uit - [enter] show subkeys - [backspace] show parent key - ↓↑ select key - [tab] select value pane - ←→ resize panes",
+                    // Pane::List =>   "q)uit - [enter] show subkeys - [backspace] show parent key - ↓↑ select key - [tab] select value pane - ←→ resize panes",
+                    Pane::List =>   &format!("list_height {} - list_offset {} - total_keys {} - num trees {}", self.list_height, self.list_offset, self.app.total_keys, self.app.sled_trees.len()),
                     Pane::Value =>  "↓↑←→ scroll - [shift] x10 - [tab] select key pane - e)dit"
                 };
                 frame.render_widget(Paragraph::new(key_help), vertical_chunks[2]);
@@ -325,6 +328,9 @@ impl TuiApp {
                                 self.app.go_back_in_path()?;
                             } else { // go back to tree mode, assume at least Default tree available
                                 self.view_mode = ViewMode::Trees;
+                                self.list_offset = 0;
+                                self.app.total_keys = 0;
+                                self.app.current_tree = None;
                             }
                             self.list_state.select(Some(0));
                         },
