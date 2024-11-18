@@ -70,78 +70,6 @@ impl TuiApp {
     }
 
 
-    fn update_list(&mut self) -> Result<()> {
-        // Get just enough items to fill the visible area
-        self.app.set_key_range(self.list_offset, self.list_height as usize)?;
-        Ok(())
-    }
-
-    fn handle_list_navigation(&mut self, key: KeyCode) -> Result<()> {
-        let total_keys = self.app.total_keys();
-        if total_keys == 0 {
-            return Ok(());
-        }
-
-        let relative_selection = self.list_state.selected().unwrap_or(0);  // Relative to visible items
-        let absolute_selection = self.list_offset + relative_selection;  // Actual position in full dataset
-
-
-        match key {
-            KeyCode::Up => {
-                if absolute_selection > 0 {
-                    if relative_selection > 0 {
-                        // Just move the selection up
-                        self.list_state.select(Some(relative_selection - 1));
-                    } else {
-                        // At top of window, need to shift window up
-                        self.list_offset = self.list_offset.saturating_sub(1);
-                        self.update_list()?;
-                    }
-                }
-            },
-            KeyCode::Down => {
-                if absolute_selection + 1 < total_keys {
-                    if relative_selection + 1 < self.list_height as usize {
-                        // Just move the selection down
-                        self.list_state.select(Some(relative_selection + 1));
-                    } else {
-                        // At bottom of window, need to shift window down
-                        self.list_offset += 1;
-                        self.update_list()?;
-                    }
-                }
-            },
-            KeyCode::PageUp => {
-                if self.list_offset > 0 {
-                    // Move window up by visible_height or to start
-                    self.list_offset = self.list_offset.saturating_sub(self.list_height as usize);
-                    self.update_list()?;
-                    // Keep selection at top of new window
-                    self.list_state.select(Some(0));
-                } else if relative_selection > 0 {
-                    // Already at top of data, just move selection to top of window
-                    self.list_state.select(Some(0));
-                }
-            },
-            KeyCode::PageDown => {
-                let max_offset = total_keys.saturating_sub(self.list_height as usize);
-                if self.list_offset < max_offset {
-                    // Move window down by visible_height or to end
-                    self.list_offset = (self.list_offset + self.list_height as usize).min(max_offset);
-                    self.update_list()?;
-                    // Keep selection at bottom of new window
-                    self.list_state.select(Some(self.list_height as usize - 1));
-                } else if relative_selection < self.list_height as usize - 1 {
-                    // Already at bottom of data, just move selection to bottom of window
-                    self.list_state.select(Some(self.list_height as usize - 1));
-                }
-            },
-            _ => {}
-        }
-        Ok(())
-    }
-
-
     pub fn run(&mut self, running: Arc<AtomicBool>) -> Result<()> {
         loop {
             self.draw()?;
@@ -164,8 +92,8 @@ impl TuiApp {
                 ].as_ref())
                 .split(frame.area());
 
-                self.list_height = vertical_chunks[0].height.saturating_sub(2);
-                self.page_height = vertical_chunks[1].height.saturating_sub(2);
+            self.list_height = vertical_chunks[1].height.saturating_sub(2);
+            self.page_height = vertical_chunks[1].height.saturating_sub(2); // calculate this again, don't just copy list_height as may not be same in future
 
 
             // Render path at top
@@ -207,10 +135,23 @@ impl TuiApp {
             // render tree or key list
             match self.view_mode {
                 ViewMode::Trees => {
-                    self.draw_tree_list(&frame, chunks[0]);
+                    draw_tree_list(
+                        frame,
+                        chunks[0],
+                        &self.app.sled_trees,
+                        &mut self.list_state,
+                        self.app.total_keys
+                    );
                 }
                 ViewMode::Keys => {
-                    self.draw_key_list(&frame, chunks[0]);
+                    draw_key_list(
+                        frame,
+                        chunks[0],
+                        &self.app.current_key_range.keys,
+                        &mut self.list_state,
+                        self.app.total_keys,
+                        self.app.current_tree.as_ref()
+                    );
                 }
             }
 
@@ -288,81 +229,6 @@ impl TuiApp {
 
 
 
-    fn draw_tree_list(&mut self, frame: &Frame, area: Rect) {
-        if self.app.sled_trees.len() > 0 {
-            // let list_title = match self.view_mode {
-            //     ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
-            //     ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
-            // };
-
-            // let list_height = chunks[0].height.saturating_sub(2) as usize;
-
-            let items: Vec<ListItem> = self.app.current_key_range.keys.clone()
-                .into_iter()
-                .map(|entry| {
-                    if entry.has_children {
-                        ListItem::new(format!("{} +", entry.key))
-                    } else {
-                        ListItem::new(entry.key)
-                    }
-                })
-                .collect();
-
-            let keys_list = List::new(items)
-                .block(Block::default()
-                    .title(format!(" {} Keys ", self.app.total_keys()))
-                    .borders(Borders::ALL))
-                .highlight_style(Style::default().reversed());
-            
-            frame.render_stateful_widget(keys_list, area, &mut self.list_state);
-        } else {
-            let db_name = if let Some(db) = self.app.db { 
-                String::from_utf8_lossy(db.name().to_bytes);
-            } else { 
-                "nil".to_owned()
-            };
-            frame.render_widget( Paragraph::new(format!("Could not retrieve tree list from database. This is probably a corrupt database or a bug", &self.app.db.unwrap_or(default).name())), area );
-        }
-    }
-
-
-    fn draw_key_list(&mut self, frame: &Frame, area: Rect) {
-        if self.app.current_key_range.keys.len() > 0 {
-            // let list_title = match self.view_mode {
-            //     ViewMode::Trees => format!(" {} Trees:", self.app.sled_trees.len()),
-            //     ViewMode::Keys => format!(" {} Keys:", self.app.total_keys()),
-            // };
-
-            // let list_height = chunks[0].height.saturating_sub(2) as usize;
-
-            let items: Vec<ListItem> = self.app.current_key_range.keys.clone()
-                .into_iter()
-                .map(|entry| {
-                    if entry.has_children {
-                        ListItem::new(format!("{} +", entry.key))
-                    } else {
-                        ListItem::new(entry.key)
-                    }
-                })
-                .collect();
-
-            let keys_list = List::new(items)
-                .block(Block::default()
-                    .title(format!(" {} Keys ", self.app.total_keys()))
-                    .borders(Borders::ALL))
-                .highlight_style(Style::default().reversed());
-            
-            frame.render_stateful_widget(keys_list, area, &mut self.list_state);
-        } else {
-            let tree_name = if let Some(tree) = &self.app.current_tree {
-                &String::from_utf8_lossy(&tree.name()).into_owned()
-            } else {
-                "Default"
-            };
-
-            frame.render_widget( Paragraph::new(format!("No Keys found in tree {}", &tree_name)), area );
-        }
-    }
 
 
     fn handle_input(&mut self, running: Arc<AtomicBool>) -> Result<()> {
@@ -477,6 +343,92 @@ impl TuiApp {
         Ok(())
     }
 
+
+    fn handle_list_navigation(&mut self, key: KeyCode) -> Result<()> {
+        let element_count = match self.view_mode {
+            ViewMode::Trees => self.app.sled_trees.len(),
+            ViewMode::Keys => self.app.total_keys,
+        };
+
+        if matches!(self.view_mode, ViewMode::Keys) && element_count == 0 {
+            return Ok(());
+        }
+
+        let relative_selection = self.list_state.selected().unwrap_or(0);  // Relative to visible items
+        let absolute_selection = self.list_offset + relative_selection;  // Actual position in full dataset
+
+        match key {
+            KeyCode::Up => {
+                if absolute_selection > 0 {
+                    if relative_selection > 0 {
+                        // Just move the selection up
+                        self.list_state.select(Some(relative_selection - 1));
+                    } else {
+                        // At top of window, need to shift window up
+                        self.list_offset = self.list_offset.saturating_sub(1);
+                        if matches!(self.view_mode, ViewMode::Keys) {
+                            self.update_list()?;
+                        }
+                    }
+                }
+            },
+            KeyCode::Down => {
+                if absolute_selection + 1 < element_count {
+                    if relative_selection + 1 < self.list_height as usize {
+                        // Just move the selection down
+                        self.list_state.select(Some(relative_selection + 1));
+                    } else {
+                        // At bottom of window, need to shift window down
+                        self.list_offset += 1;
+                        if matches!(self.view_mode, ViewMode::Keys) {
+                            self.update_list()?;
+                        }
+                    }
+                }
+            },
+            KeyCode::PageUp => {
+                if self.list_offset > 0 {
+                    // Move window up by visible_height or to start
+                    self.list_offset = self.list_offset.saturating_sub(self.list_height as usize);
+                    if matches!(self.view_mode, ViewMode::Keys) {
+                        self.update_list()?;
+                    }
+            // Keep selection at top of new window
+                    self.list_state.select(Some(0));
+                } else if relative_selection > 0 {
+                    // Already at top of data, just move selection to top of window
+                    self.list_state.select(Some(0));
+                }
+            },
+            KeyCode::PageDown => {
+                let max_offset = element_count.saturating_sub(self.list_height as usize);
+                if self.list_offset < max_offset {
+                    // Move window down by visible_height or to end
+                    self.list_offset = (self.list_offset + self.list_height as usize).min(max_offset);
+                    if matches!(self.view_mode, ViewMode::Keys) {
+                        self.update_list()?;
+                    }
+            // Keep selection at bottom of new window
+                    self.list_state.select(Some(self.list_height as usize - 1));
+                } else if relative_selection < self.list_height as usize - 1 {
+                    // Already at bottom of data, just move selection to bottom of window
+                    self.list_state.select(Some(self.list_height as usize - 1));
+                }
+            },
+            _ => {}
+        }
+        // panic!("list height is {}", self.list_height);
+        Ok(())
+    }
+
+
+    fn update_list(&mut self) -> Result<()> {
+        // Get just enough items to fill the visible area
+        self.app.set_key_range(self.list_offset, self.list_height as usize)?;
+        Ok(())
+    }
+
+
 }    
 
 
@@ -485,6 +437,80 @@ impl Drop for TuiApp {
         let _ = ratatui::restore();
     }
 }
+
+
+fn draw_tree_list(
+    frame: &mut Frame,
+    area: Rect,
+    trees: &Vec<String>,
+    list_state: &mut ListState,
+    total_keys: usize,
+) {
+    if !trees.is_empty() {
+        let items: Vec<ListItem> = trees
+            .iter()
+            .map(|entry| {
+                ListItem::new(entry.clone())
+            })
+            .collect();
+
+        let trees_list = List::new(items)
+            .block(Block::default()
+                .title(format!(" {} Keys ", total_keys))
+                .borders(Borders::ALL))
+            .highlight_style(Style::default().reversed());
+        
+        frame.render_stateful_widget(trees_list, area, list_state);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No SledDB trees found!"),
+            area
+        );
+    }
+}
+
+
+fn draw_key_list(
+    frame: &mut Frame,
+    area: Rect,
+    keys: &Vec<KeyEntry>,
+    list_state: &mut ListState,
+    total_keys: usize,
+    current_tree: Option<&sled::Tree>,
+) {
+    if !keys.is_empty() {
+        let items: Vec<ListItem> = keys
+            .iter()
+            .map(|entry| {
+                if entry.has_children {
+                    ListItem::new(format!("{} +", entry.key))
+                } else {
+                    ListItem::new(entry.key.clone())
+                }
+            })
+            .collect();
+
+        let keys_list = List::new(items)
+            .block(Block::default()
+                .title(format!(" {} Keys ", total_keys))
+                .borders(Borders::ALL))
+            .highlight_style(Style::default().reversed());
+        
+        frame.render_stateful_widget(keys_list, area, list_state);
+    } else {
+        let tree_name = if let Some(tree) = current_tree {
+            String::from_utf8_lossy(&tree.name()).into_owned()
+        } else {
+            "Default".to_owned()
+        };
+
+        frame.render_widget(
+            Paragraph::new(format!("No Keys found in tree {}", tree_name)),
+            area
+        );
+    }
+}
+
 
 
 fn calculate_wrapped_lines(text: &str, width: u16) -> usize {

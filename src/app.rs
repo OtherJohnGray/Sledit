@@ -16,7 +16,8 @@ pub struct App {
     // If no delimiter, offset and range are within set of all keys in the sled tree
     // if delimiter, offset and range are within the branch of cached_key_tree that is 
     // identified by current_path
-    pub current_key_range: KeyRange, // (offset, visible_keys)   
+    pub current_key_range: KeyRange, // (offset, visible_keys)  
+    pub total_keys: usize, 
 }
 
 struct KeyTree {
@@ -48,6 +49,7 @@ impl App {
             delimiter: None,
             cached_key_tree: None,
             current_key_range: KeyRange{ offset: 0, keys: vec![] },
+            total_keys: 0,
         }
     }
 
@@ -128,7 +130,7 @@ impl App {
 
 
     // Total number of keys that can be scrolled in the left pane
-    pub fn total_keys(&self) -> usize {
+    fn total_keys(&self) -> usize {
         if self.current_tree.is_none() { return 0 }
         if self.delimiter.is_none() { return (self.current_tree.as_ref().expect("This is a bug. There should be a guard clause immediately before this.")).len() }
         if self.cached_key_tree.is_none() { return 0 }
@@ -166,6 +168,7 @@ impl App {
             if self.delimiter.is_some() {
                 self.build_key_tree()?;
             }
+            self.total_keys = self.total_keys();
         }
         Ok(())
     }
@@ -183,13 +186,15 @@ impl App {
     // get the value associated with a particular current key
     pub fn get_value(&mut self, index: usize) -> Result<Option<Vec<u8>>, Error> {
         if let Some(tree) = &self.current_tree {
-            let key = self.current_key_range.keys[index].to_owned();
-            let mut new_path = self.current_path.clone();
-            new_path.push(key.key);
-            let full_key = new_path.join("/");
-            let value = tree.get(full_key.as_bytes())?;
-            if let Some(value) = value {
-                return Ok(Some(value.to_vec()));
+            if self.current_key_range.keys.len() > index {
+                let key = self.current_key_range.keys[index].to_owned();
+                let mut new_path = self.current_path.clone();
+                new_path.push(key.key);
+                let full_key = new_path.join("/");
+                let value = tree.get(full_key.as_bytes())?;
+                if let Some(value) = value {
+                    return Ok(Some(value.to_vec()));
+                }
             }
         }
         Ok(None)
